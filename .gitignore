@@ -8,6 +8,11 @@ dist/
 .venv/
 venv/
 
+# Rust
+/target/
+**/target/
+*.rs.bk
+
 # outputs / data
 derivatives/
 *.nii
@@ -22,3 +27,7 @@ work/
 .DS_Store
 .idea/
 .vscode/
+
+# committed synthetic test fixtures (deterministic, no PHI) — re-include despite *.nii.gz above
+!tools/phantom/
+!tools/phantom/*.nii.gz
