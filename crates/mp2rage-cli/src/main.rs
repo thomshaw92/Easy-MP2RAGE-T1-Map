@@ -63,8 +63,37 @@ fn save(dir: &str, name: &str, vol: &Array3<f64>, aff: &mp2rage_core::Affine) {
     println!("  wrote {p}");
 }
 
+/// Hidden self-test: read a DICOM folder, assemble, and write a derived series
+/// using the assembled volume itself as the "T1" — so a pydicom round-trip can
+/// confirm the writer preserves pixels + geometry.
+fn dicom_selftest(dir: &str, outdir: &str) {
+    use mp2rage_core::dicom;
+    let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok())
+        .map(|e| e.path()).filter(|p| p.is_file()).collect();
+    paths.sort();
+    let dcm: Vec<Vec<u8>> = paths.iter().filter_map(|p| std::fs::read(p).ok())
+        .filter(|b| dicom::parse(b).is_ok()).collect();
+    let files: Vec<_> = dcm.iter().map(|b| dicom::parse(b).unwrap()).collect();
+    let s = dicom::assemble(files).unwrap();
+    println!("assembled [{},{},{},{}]", s.nx, s.ny, s.nz, s.nt);
+    let sources: Vec<&[u8]> = dcm.iter().map(|b| b.as_slice()).collect();
+    let t1: Vec<f32> = s.data[..s.nx * s.ny * s.nz].to_vec();
+    let out = dicom::write_derived_series(&sources, &t1, s.nx, s.ny, s.nz, "97531").unwrap();
+    std::fs::create_dir_all(outdir).unwrap();
+    for (i, f) in out.iter().enumerate() {
+        std::fs::write(format!("{outdir}/t1_{i:04}.dcm"), f).unwrap();
+    }
+    println!("wrote {} derived DICOM files to {outdir}", out.len());
+}
+
 fn main() {
     let m = parse();
+    if let Some(st) = m.get("dicom-selftest") {
+        if st.len() >= 2 {
+            dicom_selftest(&st[0], &st[1]);
+            return;
+        }
+    }
     let (uni_p, inv2_p, out) = match (path(&m, "uni"), path(&m, "inv2"), path(&m, "out")) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => usage(),

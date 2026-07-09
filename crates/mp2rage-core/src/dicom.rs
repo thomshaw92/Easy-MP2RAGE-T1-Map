@@ -288,3 +288,161 @@ pub fn assemble(files: Vec<DicomFile>) -> Result<Series, String> {
     Ok(Series { data, nx, ny, nz, nt, affine: a, role, rep })
 }
 
+// ===========================================================================
+// Derived-series writer: clone the source MR slices, swap in the T1 pixels and
+// a few tags -> a DERIVED\SECONDARY MR Image Storage series any viewer loads.
+// Explicit VR Little Endian only (our Siemens case).
+// ===========================================================================
+struct Elem { group: u16, elem: u16, vr: [u8; 2], data: Vec<u8> }
+
+fn is_long_vr(vr: &[u8; 2]) -> bool { VR_LONG.iter().any(|v| *v == vr) }
+
+/// Parse every top-level element (skipping sequences) of an Explicit-VR-LE file.
+fn parse_all(bytes: &[u8]) -> Result<Vec<Elem>, String> {
+    let mut pos = if bytes.len() > 132 && &bytes[128..132] == b"DICM" { 132 } else {
+        return Err("missing DICM preamble".into());
+    };
+    let mut out = Vec::new();
+    while pos + 8 <= bytes.len() {
+        let group = u16le(bytes, pos);
+        let elem = u16le(bytes, pos + 2);
+        pos += 4;
+        let vr = [bytes[pos], bytes[pos + 1]];
+        pos += 2;
+        // require explicit VR: VR bytes must be uppercase ASCII
+        if !(vr[0].is_ascii_uppercase() && vr[1].is_ascii_uppercase()) {
+            return Err("DICOM output needs Explicit VR Little Endian source".into());
+        }
+        let len = if is_long_vr(&vr) {
+            pos += 2;
+            let l = u32le(bytes, pos) as usize; pos += 4; l
+        } else {
+            let l = u16le(bytes, pos) as usize; pos += 2; l
+        };
+        if &vr == b"SQ" || len == 0xFFFF_FFFF {
+            // skip sequences (drop from the derived object)
+            if len == 0xFFFF_FFFF {
+                while pos + 8 <= bytes.len() {
+                    let tg = u16le(bytes, pos); let te = u16le(bytes, pos + 2);
+                    let il = u32le(bytes, pos + 4) as usize; pos += 8;
+                    if tg == 0xFFFE && te == 0xE0DD { break; }
+                    if il != 0xFFFF_FFFF { pos += il; }
+                }
+            } else { pos += len; }
+            continue;
+        }
+        if pos + len > bytes.len() { break; }
+        out.push(Elem { group, elem, vr, data: bytes[pos..pos + len].to_vec() });
+        pos += len;
+    }
+    Ok(out)
+}
+
+fn even(mut d: Vec<u8>, pad: u8) -> Vec<u8> {
+    if d.len() % 2 == 1 { d.push(pad); }
+    d
+}
+
+fn set_elem(elems: &mut Vec<Elem>, group: u16, elem: u16, vr: &[u8; 2], data: Vec<u8>) {
+    let data = even(data, if vr == b"UI" || vr == b"OW" || vr == b"OB" { 0 } else { b' ' });
+    if let Some(e) = elems.iter_mut().find(|e| e.group == group && e.elem == elem) {
+        e.vr = *vr; e.data = data;
+    } else {
+        elems.push(Elem { group, elem, vr: *vr, data });
+    }
+}
+fn get_elem<'a>(elems: &'a [Elem], group: u16, elem: u16) -> Option<&'a [u8]> {
+    elems.iter().find(|e| e.group == group && e.elem == elem).map(|e| e.data.as_slice())
+}
+
+fn write_elem(out: &mut Vec<u8>, e: &Elem) {
+    out.extend_from_slice(&e.group.to_le_bytes());
+    out.extend_from_slice(&e.elem.to_le_bytes());
+    out.extend_from_slice(&e.vr);
+    if is_long_vr(&e.vr) {
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&(e.data.len() as u32).to_le_bytes());
+    } else {
+        out.extend_from_slice(&(e.data.len() as u16).to_le_bytes());
+    }
+    out.extend_from_slice(&e.data);
+}
+
+fn serialize(elems: &[Elem]) -> Vec<u8> {
+    let mut out = vec![0u8; 128];
+    out.extend_from_slice(b"DICM");
+    // meta group (0002): recompute its group length
+    let mut meta: Vec<&Elem> = elems.iter().filter(|e| e.group == 0x0002 && e.elem != 0x0000).collect();
+    meta.sort_by_key(|e| e.elem);
+    let mut meta_bytes = Vec::new();
+    for e in &meta { write_elem(&mut meta_bytes, e); }
+    let glen = Elem { group: 0x0002, elem: 0x0000, vr: *b"UL", data: (meta_bytes.len() as u32).to_le_bytes().to_vec() };
+    write_elem(&mut out, &glen);
+    out.extend_from_slice(&meta_bytes);
+    // dataset, sorted by (group, elem)
+    let mut ds: Vec<&Elem> = elems.iter().filter(|e| e.group != 0x0002).collect();
+    ds.sort_by_key(|e| (e.group, e.elem));
+    for e in &ds { write_elem(&mut out, e); }
+    out
+}
+
+/// Build a derived T1 (ms) DICOM series from the source slices + the computed
+/// volume (i-fastest, same grid/order the source assembled to). `salt` is a
+/// numeric string that makes the generated UIDs unique.
+pub fn write_derived_series(sources: &[&[u8]], t1: &[f32], nx: usize, ny: usize, nz: usize, salt: &str)
+    -> Result<Vec<Vec<u8>>, String> {
+    // order source files by position along the slice normal (same as assemble)
+    let mut parsed: Vec<(usize, f64)> = Vec::new();
+    let mut normal = [0.0; 3];
+    for (idx, &b) in sources.iter().enumerate() {
+        let f = parse(b)?;
+        if idx == 0 {
+            let row = [f.iop[0], f.iop[1], f.iop[2]];
+            let col = [f.iop[3], f.iop[4], f.iop[5]];
+            normal = cross(row, col);
+        }
+        parsed.push((idx, f.ipp[0] * normal[0] + f.ipp[1] * normal[1] + f.ipp[2] * normal[2]));
+    }
+    parsed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    if parsed.len() != nz {
+        return Err(format!("source slices ({}) != volume slices ({nz})", parsed.len()));
+    }
+    let root = "1.2.826.0.1.3680043.2.1125";
+    let series_uid = format!("{root}.{salt}.1");
+    let mut files = Vec::with_capacity(nz);
+    for (k, &(src_idx, _)) in parsed.iter().enumerate() {
+        let mut elems = parse_all(sources[src_idx])?;
+        // new pixel data (uint16 ms) for slice k, in row-major (row*cols+col)
+        let mut px = vec![0u8; nx * ny * 2];
+        for row in 0..ny {
+            for coln in 0..nx {
+                let v = t1[coln + nx * (row + ny * k)].max(0.0).round().min(65535.0) as u16;
+                let o = (row * nx + coln) * 2;
+                px[o] = (v & 0xff) as u8;
+                px[o + 1] = (v >> 8) as u8;
+            }
+        }
+        let sop = format!("{root}.{salt}.{}", k + 2);
+        set_elem(&mut elems, 0x7FE0, 0x0010, b"OW", px);
+        set_elem(&mut elems, 0x0008, 0x0018, b"UI", sop.clone().into_bytes());
+        set_elem(&mut elems, 0x0002, 0x0003, b"UI", sop.into_bytes());
+        set_elem(&mut elems, 0x0020, 0x000E, b"UI", series_uid.clone().into_bytes());
+        set_elem(&mut elems, 0x0008, 0x103E, b"LO", b"T1 map (ms) - Easy-MP2RAGE-T1-Map".to_vec());
+        set_elem(&mut elems, 0x0008, 0x0008, b"CS", b"DERIVED\\SECONDARY".to_vec());
+        set_elem(&mut elems, 0x0020, 0x0011, b"IS", b"9001".to_vec());
+        set_elem(&mut elems, 0x0028, 0x1052, b"DS", b"0".to_vec());
+        set_elem(&mut elems, 0x0028, 0x1053, b"DS", b"1".to_vec());
+        set_elem(&mut elems, 0x0028, 0x1054, b"LO", b"ms".to_vec());
+        set_elem(&mut elems, 0x0028, 0x0100, b"US", 16u16.to_le_bytes().to_vec());
+        set_elem(&mut elems, 0x0028, 0x0101, b"US", 16u16.to_le_bytes().to_vec());
+        set_elem(&mut elems, 0x0028, 0x0102, b"US", 15u16.to_le_bytes().to_vec());
+        set_elem(&mut elems, 0x0028, 0x0103, b"US", 0u16.to_le_bytes().to_vec());
+        // ensure a Modality is present (keep source's if any)
+        if get_elem(&elems, 0x0008, 0x0060).is_none() {
+            set_elem(&mut elems, 0x0008, 0x0060, b"CS", b"MR".to_vec());
+        }
+        files.push(serialize(&elems));
+    }
+    Ok(files)
+}
+

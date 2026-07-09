@@ -3,6 +3,7 @@
 //! `tests/parity.rs`) and reused verbatim by the WASM build.
 
 pub mod correct;
+pub mod denoise;
 pub mod dicom;
 pub mod filt;
 pub mod interp;

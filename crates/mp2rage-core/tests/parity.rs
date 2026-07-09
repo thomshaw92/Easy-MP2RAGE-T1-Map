@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use mp2rage_core::model::{self, Mp2rageParams, Sa2rageParams};
-use mp2rage_core::{correct, filt, interp, mask, resample};
+use mp2rage_core::{correct, denoise, filt, interp, mask, resample};
 use ndarray::{Array1, Array2, Array3};
 use ndarray_npy::read_npy;
 
@@ -239,6 +239,15 @@ fn t1b1_correct_with_b1map_matches() {
     let res = correct::t1b1_correct_with_b1map(&uni, &b1, &mp_params(), &brain);
     assert_close("v_b1map_corr_T1_ms", res.t1_ms.as_slice().unwrap(), load3f64("v_b1map_corr_T1_ms").as_slice().unwrap(), 1e-6, 1e-4);
     assert_close("v_b1map_corr_UNI", res.uni_corr.as_slice().unwrap(), load3f64("v_b1map_corr_UNI").as_slice().unwrap(), 0.0, 0.0);
+}
+
+#[test]
+fn robust_combination_matches() {
+    let uni = load3f64("u_rc_uni");
+    let inv1 = load3f64("u_rc_inv1");
+    let inv2 = load3f64("u_rc_inv2");
+    let got = denoise::robust_combination(&uni, &inv1, &inv2, 6.0);
+    assert_close("u_rc_out", got.as_slice().unwrap(), load3f64("u_rc_out").as_slice().unwrap(), 1e-9, 1e-9);
 }
 
 #[test]

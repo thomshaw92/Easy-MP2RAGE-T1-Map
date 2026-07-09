@@ -2,7 +2,8 @@
 // Parses NIfTI in JS (nifti.js), runs the WASM core in a Web Worker, previews
 // with NiiVue, and offers client-side downloads. No data ever leaves the tab.
 import { readNifti, writeNiftiF32, writeNiftiGz } from './nifti.js';
-import initWasm, { parse_dicom_series } from '../wasm/mp2rage_wasm.js';
+import { zipStore } from './zip.js';
+import initWasm, { parse_dicom_series, write_dicom_t1 } from '../wasm/mp2rage_wasm.js';
 
 let wasmReady;
 function ensureWasm() {
@@ -52,15 +53,15 @@ function buildForm(grid, spec, prefix) {
   }
 }
 function applyPreset(which) {
-  const idx = which === '3T' ? 3 : 2;
   for (const [id, , , d3] of MP_SPEC) { const e = $(`#mp_${id}`); if (e) e.value = which === '3T' ? d3 : MP_SPEC.find(s => s[0] === id)[2]; }
   for (const [id, , , d3] of SA_SPEC) { const e = $(`#sa_${id}`); if (e) e.value = which === '3T' ? d3 : SA_SPEC.find(s => s[0] === id)[2]; }
-  $('#paramSource').textContent = which + ' preset';
+  $('#paramSrcNote').textContent = which + ' preset';
+  $('#paramSource').value = 'manual';
 }
 buildForm($('#mpGrid'), MP_SPEC, 'mp');
 buildForm($('#saGrid'), SA_SPEC, 'sa');
 buildForm($('#b1Grid'), B1_SPEC, 'b1');
-document.querySelectorAll('.presets button').forEach((b) => b.onclick = () => applyPreset(b.dataset.preset));
+document.querySelectorAll('.presetbtn').forEach((b) => b.onclick = () => applyPreset(b.dataset.preset));
 
 const num = (id) => parseFloat($(id).value);
 const mpParams = () => [num('#mp_tr'), num('#mp_ti1'), num('#mp_ti2'), num('#mp_fa1'), num('#mp_fa2'), num('#mp_nz1'), num('#mp_nz2'), num('#mp_trflash'), num('#mp_inveff')];
@@ -68,7 +69,7 @@ const saParams = () => [num('#sa_tr'), num('#sa_ti1'), num('#sa_ti2'), num('#sa_
 
 // ---- file ingest -----------------------------------------------------------
 const ROLES = ['(ignore)', 'UNI', 'INV1', 'INV2', 'SA2RAGE', 'B1 map'];
-const state = { files: [] };
+const state = { files: [], jsons: [] };
 
 function guessRole(name) {
   const n = name.toLowerCase();
@@ -85,8 +86,12 @@ async function addFiles(fileList) {
     const lower = file.name.toLowerCase();
     const buf = await file.arrayBuffer();
     if (lower.endsWith('.json')) {
-      try { applySidecar(file.name, JSON.parse(new TextDecoder().decode(buf))); log(`sidecar: ${file.name}`); }
-      catch (e) { log(`could not parse ${file.name}: ${e}`); }
+      try {
+        const js = JSON.parse(new TextDecoder().decode(buf));
+        state.jsons.push({ name: file.name, json: js });
+        if ($('#paramSource').value === 'json') applySidecar(file.name, js);
+        log(`sidecar: ${file.name}`);
+      } catch (e) { log(`could not parse ${file.name}: ${e}`); }
       continue;
     }
     if (!/\.nii(\.gz)?$/.test(lower)) { log(`skipped ${file.name} (not .nii/.nii.gz/.json)`); continue; }
@@ -106,8 +111,21 @@ function applySidecar(name, js) {
   if (/inv-?1|inv1/.test(n)) { set('#mp_ti1', js.InversionTime); set('#mp_fa1', js.FlipAngle); }
   if (/inv-?2|inv2/.test(n)) { set('#mp_ti2', js.InversionTime); set('#mp_fa2', js.FlipAngle); }
   if (/mp2rage|uni|inv/.test(n) && js.RepetitionTime) set('#mp_tr', js.RepetitionTime);
-  $('#paramSource').textContent = 'from sidecars';
+  $('#paramSrcNote').textContent = 'from sidecars';
 }
+
+function reloadFromJsons() {
+  if (!state.jsons.length) { log('no JSON sidecars loaded — drop the .json files too'); return; }
+  for (const j of state.jsons) applySidecar(j.name, j.json);
+  $('#paramSource').value = 'json';
+  log(`reloaded MP2RAGE parameters from ${state.jsons.length} sidecar(s)`);
+}
+$('#reloadJson').onclick = reloadFromJsons;
+$('#paramSource').onchange = () => {
+  const v = $('#paramSource').value;
+  if (v === 'json') reloadFromJsons();
+  else $('#paramSrcNote').textContent = v === 'dicom' ? 'from DICOM headers' : 'manual';
+};
 
 function renderTable() {
   const tb = $('#filetable tbody'); tb.innerHTML = '';
@@ -125,23 +143,53 @@ function renderTable() {
     del.appendChild(b); tr.appendChild(del);
     tb.appendChild(tr);
   }
-  $('#filetable').classList.toggle('hidden', state.files.length === 0);
+  // JSON sidecar rows
+  for (const [i, j] of state.jsons.entries()) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>📄 ${j.name}</td><td class="dim">JSON</td><td class="dim">parameters (matched by name)</td>`;
+    const del = document.createElement('td');
+    const b = document.createElement('button'); b.className = 'secondary'; b.textContent = '✕'; b.style.padding = '2px 9px';
+    b.onclick = () => { state.jsons.splice(i, 1); renderTable(); };
+    del.appendChild(b); tr.appendChild(del);
+    tb.appendChild(tr);
+  }
+  $('#filetable').classList.toggle('hidden', state.files.length === 0 && state.jsons.length === 0);
 }
 
 function byRole(r) { return state.files.find((f) => f.role === r); }
 
 function refreshRunState() {
-  const uni = byRole('UNI'), inv2 = byRole('INV2'), sa = byRole('SA2RAGE'), b1 = byRole('B1 map');
-  const mode = sa ? 'sa2rage' : (b1 ? 'b1map' : null);
-  $('#saBlock').classList.toggle('hidden', mode === 'b1map');
-  $('#b1Block').classList.toggle('hidden', mode !== 'b1map');
-  const ok = uni && mode;
+  const uni = byRole('UNI'), inv1 = byRole('INV1'), inv2 = byRole('INV2'), sa = byRole('SA2RAGE'), b1 = byRole('B1 map');
+  const task = $('#taskSel').value;
+  $('#regField').style.display = task === 'denoise' ? '' : 'none';
+  let ok = false, status = '', mode = null, label = 'Compute';
+  if (task === 'denoise') {
+    ok = !!(uni && inv1 && inv2);
+    label = 'Denoise UNI';
+    status = ok ? 'Ready: robust-combination denoising (UNI + INV1 + INV2).' : 'Denoise needs UNI, INV1 and INV2.';
+    $('#saBlock').classList.add('hidden'); $('#b1Block').classList.add('hidden');
+  } else if (task === 'b1only') {
+    mode = 'sa2rage';
+    ok = !!(uni && inv2 && sa);
+    label = 'Compute B1 map';
+    status = ok ? 'Ready: relative B1 map from SA2RAGE.' : 'SA2RAGE → B1 needs UNI, INV2 and SA2RAGE.';
+    $('#saBlock').classList.remove('hidden'); $('#b1Block').classList.add('hidden');
+  } else {
+    mode = sa ? 'sa2rage' : (b1 ? 'b1map' : null);
+    ok = !!(uni && mode);
+    label = 'Compute T1 map';
+    $('#saBlock').classList.toggle('hidden', mode === 'b1map');
+    $('#b1Block').classList.toggle('hidden', mode !== 'b1map');
+    status = ok
+      ? `Ready: ${mode === 'sa2rage' ? 'SA2RAGE' : 'B1-map'} correction${inv2 ? '' : ' (no INV2 → mask from UNI)'}.`
+      : 'Need a UNI and a B1 source (SA2RAGE or B1 map).';
+  }
   $('#run').disabled = !ok;
-  $('#status').textContent = ok
-    ? `Ready: ${mode === 'sa2rage' ? 'SA2RAGE' : 'B1-map'} correction${inv2 ? '' : ' (no INV2 → mask from UNI)'}.`
-    : 'Need a UNI and a B1 source (SA2RAGE or B1 map).';
-  return { uni, inv2, sa, b1, mode };
+  $('#run').textContent = label;
+  $('#status').textContent = status;
+  return { uni, inv1, inv2, sa, b1, mode, task };
 }
+$('#taskSel').onchange = refreshRunState;
 
 // ---- DICOM folders --------------------------------------------------------
 const getFile = (entry) => new Promise((res) => entry.file(res));
@@ -176,14 +224,15 @@ async function addDicomFolder(name, files) {
   try { v = parse_dicom_series(concat, offsets); }
   catch (e) { log(`  ${name}: ${e}`); return; }
   const dims = Array.from(v.dims);
-  state.files.push({ name, dims, affine: v.affine, data: v.data, role: v.role, dicom: true });
+  state.files.push({ name, dims, affine: v.affine, data: v.data, role: v.role, dicom: true, src: { concat, offsets } });
   log(`  ${name} → [${dims.join('×')}] role ${v.role}`);
   const params = Array.from(v.params);
   if (params.length === 7) {
     ['mp_tr', 'mp_ti1', 'mp_ti2', 'mp_fa1', 'mp_fa2', 'mp_nz1', 'mp_nz2'].forEach((id, i) => {
       const el = $('#' + id); if (el) el.value = +params[i].toFixed(4);
     });
-    $('#paramSource').textContent = 'from DICOM header';
+    $('#paramSrcNote').textContent = 'from DICOM header';
+    $('#paramSource').value = 'dicom';
     log('  auto-filled MP2RAGE parameters from the DICOM ASCCONV header');
   }
   renderTable(); refreshRunState();
@@ -214,6 +263,25 @@ $('#file').onchange = (e) => addFiles(e.target.files);
 ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('hover'); }));
 drop.addEventListener('drop', handleDrop);
 
+// folder picker (reliable DICOM import): groups the selected files by their
+// containing directory, so picking one series folder OR a parent of several works.
+async function addPickedFolders(fileList) {
+  const groups = {};
+  for (const f of [...fileList]) {
+    const rel = f.webkitRelativePath || f.name;
+    const dir = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '(folder)';
+    (groups[dir] ||= []).push(f);
+  }
+  for (const [dir, fs] of Object.entries(groups)) {
+    const niftis = fs.filter((f) => /\.(nii(\.gz)?|json)$/i.test(f.name));
+    const dcm = fs.filter((f) => !/\.(nii(\.gz)?|json)$/i.test(f.name));
+    if (niftis.length) await addFiles(niftis);
+    if (dcm.length) await addDicomFolder(dir.split('/').pop() || dir, dcm);
+  }
+}
+$('#pickFolder').onclick = () => $('#folder').click();
+$('#folder').onchange = (e) => addPickedFolders(e.target.files);
+
 // ---- run -------------------------------------------------------------------
 let worker;
 function getWorker() {
@@ -224,18 +292,28 @@ function getWorker() {
 const outputs = {}; // key -> {data, dims, affine, label, range, cmap}
 
 $('#run').onclick = async () => {
-  const { uni, inv2, sa, b1, mode } = refreshRunState();
-  if (!uni || !mode) return;
+  const { uni, inv1, inv2, sa, b1, mode, task } = refreshRunState();
+  if ($('#run').disabled || !uni) return;
   $('#run').disabled = true;
   $('#progress').style.display = 'block'; setProgress(5);
-  log(`\n▶ ${mode} correction …`);
   const t0 = performance.now();
-
-  // INV2 for masking; if absent, reuse UNI (core derives a mask from it)
-  const inv2Data = inv2 ? inv2.data : uni.data;
   const dims = uni.dims.slice(0, 3);
-  const msg = { mode, uni: uni.data, inv2: inv2Data, dims: Uint32Array.from(dims), uniAff: uni.affine, mp: Float64Array.from(mpParams()) };
+  const w = getWorker();
+  outputs.uni = { data: uni.data.slice(), dims, affine: uni.affine, label: 'UNI (input)', range: [0, 4095], cmap: 'gray' };
 
+  if (task === 'denoise') {
+    log('\n▶ denoise (robust combination) …');
+    const msg = { mode: 'denoise', uni: uni.data, inv1: inv1.data, inv2: inv2.data, dims: Uint32Array.from(dims), reg: num('#reg') };
+    w.onmessage = (e) => onResult(e.data, uni, task, mode, t0);
+    setProgress(15);
+    try { w.postMessage(msg, [uni.data.buffer, inv1.data.buffer, inv2.data.buffer]); }
+    catch (err) { log('worker post failed: ' + err); $('#run').disabled = false; }
+    return;
+  }
+
+  log(`\n▶ ${task === 'b1only' ? 'SA2RAGE → B1 map' : mode + ' correction'} …`);
+  const inv2Data = inv2 ? inv2.data : uni.data;
+  const msg = { mode, uni: uni.data, inv2: inv2Data, dims: Uint32Array.from(dims), uniAff: uni.affine, mp: Float64Array.from(mpParams()) };
   const transfer = [uni.data.buffer];
   if (inv2) transfer.push(inv2.data.buffer);
   if (mode === 'sa2rage') {
@@ -246,11 +324,7 @@ $('#run').onclick = async () => {
     msg.kind = { tfl: 0, percent: 1, relative: 2 }[$('#b1_type').value]; msg.refAngle = num('#b1_refangle');
     transfer.push(b1.data.buffer);
   }
-
-  const w = getWorker();
-  w.onmessage = (e) => onResult(e.data, uni, mode, t0);
-  // keep a copy of UNI/affine for the viewer (buffers get transferred)
-  outputs.uni = { data: uni.data.slice(), dims, affine: uni.affine, label: 'UNI', range: [0, 4095], cmap: 'gray' };
+  w.onmessage = (e) => onResult(e.data, uni, task, mode, t0);
   setProgress(15);
   try { w.postMessage(msg, transfer.filter(Boolean)); }
   catch (err) { log('worker post failed: ' + err); $('#run').disabled = false; }
@@ -258,37 +332,71 @@ $('#run').onclick = async () => {
 
 function setProgress(p) { $('#progress > div').style.width = p + '%'; }
 
-async function onResult(res, uni, mode, t0) {
+function setupViews(list) {
+  const sel = $('#viewSel');
+  sel.innerHTML = '';
+  for (const [val, label] of list) { const o = document.createElement('option'); o.value = val; o.textContent = label; sel.appendChild(o); }
+  sel.value = list[0][0];
+}
+
+async function onResult(res, uni, task, mode, t0) {
   if (res.type === 'error') { log('✖ ' + res.message); $('#run').disabled = false; setProgress(0); return; }
   if (res.type === 'progress') { setProgress(res.pct); return; }
   if (res.type !== 'result') return;
   setProgress(80);
   const dims = uni.dims.slice(0, 3), aff = uni.affine;
-  outputs.t1 = { data: res.t1, dims, affine: aff, label: 'T1 corrected (ms)', range: [500, 2600], cmap: 'viridis' };
-  outputs.t1u = { data: res.t1_uncorr, dims, affine: aff, label: 'T1 uncorrected (ms)', range: [500, 2600], cmap: 'viridis' };
-  outputs.b1 = { data: res.b1, dims, affine: aff, label: 'B1 (relative)', range: [0.5, 1.3], cmap: 'plasma' };
-  outputs.unic = { data: res.uni_corr, dims, affine: aff, label: 'UNI corrected', range: [0, 4095], cmap: 'gray' };
+  for (const k of ['t1', 't1u', 'b1', 'unic']) delete outputs[k];
+  let views;
+  if (task === 'denoise') {
+    outputs.unic = { data: res.denoised, dims, affine: aff, label: 'UNI-DEN (denoised)', range: [0, 4095], cmap: 'gray' };
+    views = [['unic', 'UNI-DEN (denoised)'], ['uni', 'UNI (input)']];
+  } else {
+    outputs.t1 = { data: res.t1, dims, affine: aff, label: 'T1 corrected (ms)', range: [500, 2600], cmap: 'viridis' };
+    outputs.t1u = { data: res.t1_uncorr, dims, affine: aff, label: 'T1 uncorrected (ms)', range: [500, 2600], cmap: 'viridis' };
+    outputs.b1 = { data: res.b1, dims, affine: aff, label: 'B1 (relative)', range: [0.5, 1.3], cmap: 'plasma' };
+    outputs.unic = { data: res.uni_corr, dims, affine: aff, label: 'UNI corrected', range: [0, 4095], cmap: 'gray' };
+    views = task === 'b1only'
+      ? [['b1', 'B1 (relative)'], ['uni', 'UNI (input)']]
+      : [['t1', 'T1 corrected (ms)'], ['t1u', 'T1 uncorrected (ms)'], ['b1', 'B1 (relative)'], ['uni', 'UNI (input)']];
+  }
   const secs = ((performance.now() - t0) / 1000).toFixed(1);
   log(`✔ done in ${secs}s (wasm ${res.ms?.toFixed(0)} ms)`);
   setProgress(100);
-  await buildDownloads(mode);
+  setupViews(views);
+  await buildDownloads(task, mode, uni);
   $('#viewerWrap').style.display = 'block';
-  await showView($('#viewSel').value);
+  showView($('#viewSel').value);
   $('#run').disabled = false;
   setTimeout(() => { $('#progress').style.display = 'none'; setProgress(0); }, 800);
 }
 
 // ---- downloads -------------------------------------------------------------
-async function buildDownloads(mode) {
+async function buildDownloads(task, mode, uni) {
   const dd = $('#downloads'); dd.innerHTML = '';
-  const items = [
-    ['t1', 'T1map.nii.gz'], ['b1', 'B1map.nii.gz'],
-    ['t1u', 'T1map_uncorrected.nii.gz'], ['unic', 'UNI_b1corrected.nii.gz'],
-  ];
+  const b1name = mode === 'sa2rage' ? 'B1map_from_SA2RAGE.nii.gz' : 'B1map.nii.gz';
+  const items = task === 'denoise'
+    ? [['unic', 'UNI_denoised.nii.gz']]
+    : task === 'b1only'
+      ? [['b1', b1name]]
+      : [['t1', 'T1map.nii.gz'], ['b1', b1name], ['t1u', 'T1map_uncorrected.nii.gz'], ['unic', 'UNI_b1corrected.nii.gz']];
   for (const [key, fname] of items) {
     const o = outputs[key]; if (!o) continue;
     const gz = await writeNiftiGz(o.data, o.dims, o.affine);
     addLink(dd, new Blob([gz], { type: 'application/gzip' }), fname);
+  }
+  // derived DICOM T1 series — only for the T1 task when the UNI input was a DICOM folder
+  if (task === 't1' && uni && uni.src && outputs.t1) {
+    try {
+      await ensureWasm();
+      const dims = Uint32Array.from(uni.dims.slice(0, 3));
+      const salt = String(Date.now()).slice(-9);
+      const dout = write_dicom_t1(uni.src.concat, uni.src.offsets, outputs.t1.data, dims, salt);
+      const data = dout.data, offs = dout.offsets, files = [];
+      for (let i = 0; i < offs.length - 1; i++)
+        files.push({ name: `T1map_${String(i + 1).padStart(4, '0')}.dcm`, data: data.subarray(offs[i], offs[i + 1]) });
+      addLink(dd, new Blob([zipStore(files)], { type: 'application/zip' }), 'T1map_DICOM.zip');
+      log(`  DICOM: derived ${files.length}-slice T1 series ready (.zip)`);
+    } catch (e) { log('DICOM export skipped: ' + e); }
   }
   const prov = {
     software: 'easy-mp2rage-t1map (wasm)', mode,
@@ -353,46 +461,92 @@ function drawSlices(o) {
   drawPlane($('#csa'), o, 'sa', Math.floor(nx / 2));
 }
 
-function drawHistogram(o) {
-  const c = $('#hist'); const ctx = c.getContext('2d');
-  const W = c.width = (c.clientWidth || 800), H = c.height = 120;
-  ctx.clearRect(0, 0, W, H);
-  const isT1 = o.label.startsWith('T1');
-  const rlo = isT1 ? 300 : o.range[0], rhi = isT1 ? 4200 : o.range[1];
-  const nb = 100, bins = new Float64Array(nb);
-  let maxc = 0;
-  for (let i = 0; i < o.data.length; i++) {
-    const v = o.data[i];
+function histSmooth(data, rlo, rhi, nb) {
+  const bins = new Float64Array(nb);
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i];
     if (v > rlo && v < rhi) bins[Math.min(nb - 1, ((v - rlo) / (rhi - rlo) * nb) | 0)]++;
   }
-  for (let b = 0; b < nb; b++) maxc = Math.max(maxc, bins[b]);
-  const pad = 18;
-  ctx.fillStyle = '#93a1b0'; ctx.font = '10px -apple-system,sans-serif';
-  if (maxc === 0) { ctx.fillText('no data in range', 10, H / 2); return; }
-  const bw = (W - pad - 6) / nb;
-  const grad = ctx.createLinearGradient(0, 0, 0, H);
-  grad.addColorStop(0, '#7c5cff'); grad.addColorStop(1, '#5aa2ff');
-  ctx.fillStyle = grad;
-  for (let b = 0; b < nb; b++) {
-    const h = (bins[b] / maxc) * (H - pad - 8);
-    ctx.fillRect(pad + b * bw, H - pad - h, Math.max(1, bw - 0.5), h);
+  return bins.map((_, b) => (bins[Math.max(0, b - 1)] + 2 * bins[b] + bins[Math.min(nb - 1, b + 1)]) / 4);
+}
+
+function drawHistogram(o) {
+  const c = $('#hist'); const ctx = c.getContext('2d');
+  const W = c.width = (c.clientWidth || 800), H = c.height = 132;
+  ctx.clearRect(0, 0, W, H);
+  const isT1 = o.label.startsWith('T1');
+  const rlo = isT1 ? 400 : o.range[0], rhi = isT1 ? 3200 : o.range[1];
+  const nb = 150;
+  const pad = 20, top = 18;
+  ctx.font = '11px -apple-system,sans-serif';
+
+  // For T1 views, overlay uncorrected (pre) and B1-corrected (post).
+  const series = (isT1 && outputs.t1 && outputs.t1u)
+    ? [{ data: outputs.t1u.data, color: '#f0b03a', fill: false, label: 'uncorrected' },
+       { data: outputs.t1.data, color: '#5aa2ff', fill: true, label: 'B1-corrected' }]
+    : [{ data: o.data, color: '#5aa2ff', fill: true, label: o.label }];
+  const S = series.map((s) => ({ ...s, sm: histSmooth(s.data, rlo, rhi, nb) }));
+  let maxc = 0; for (const s of S) for (const v of s.sm) maxc = Math.max(maxc, v);
+  if (maxc === 0) { ctx.fillStyle = '#93a1b0'; ctx.fillText('no data in range', 12, H / 2); return; }
+  const xOf = (t) => pad + (t - rlo) / (rhi - rlo) * (W - pad - 8);
+  const binT1 = (b) => rlo + (b + 0.5) / nb * (rhi - rlo);
+
+  for (const s of S) {
+    ctx.beginPath();
+    for (let b = 0; b < nb; b++) {
+      const x = xOf(binT1(b)), y = H - pad - (s.sm[b] / maxc) * (H - pad - top);
+      b === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    if (s.fill) {
+      ctx.lineTo(xOf(binT1(nb - 1)), H - pad); ctx.lineTo(xOf(binT1(0)), H - pad); ctx.closePath();
+      ctx.fillStyle = s.color + 'cc'; ctx.fill();
+    } else {
+      ctx.strokeStyle = s.color; ctx.lineWidth = 1.6; ctx.stroke();
+    }
   }
+
   ctx.fillStyle = '#93a1b0';
-  ctx.fillText(`${o.label} — histogram (brain)`, pad, 12);
-  ctx.fillText(String(Math.round(rlo)), pad, H - 4);
-  ctx.textAlign = 'right'; ctx.fillText(String(Math.round(rhi)), W - 4, H - 4); ctx.textAlign = 'left';
+  ctx.fillText(isT1 ? 'T1 histogram (brain)' : `${o.label} — brain histogram`, pad, 12);
+  ctx.fillText(String(Math.round(rlo)), pad, H - 5);
+  ctx.textAlign = 'right'; ctx.fillText(String(Math.round(rhi)), W - 5, H - 5); ctx.textAlign = 'left';
+
+  // legend (top-right)
+  let lx = W - 8;
+  for (const s of [...S].reverse()) {
+    ctx.textAlign = 'right'; ctx.fillStyle = s.color; ctx.fillText(s.label, lx, 12);
+    lx -= ctx.measureText(s.label).width + 22;
+    ctx.fillRect(lx + 6, 4, 10, 8);
+  }
+  ctx.textAlign = 'left';
+
+  if (!isT1) return;
+  // WM/GM peaks from the corrected (post) distribution
+  const post = S[S.length - 1].sm;
+  const peakIn = (lo, hi) => {
+    let bi = -1, bc = -1;
+    for (let b = 0; b < nb; b++) { const t = binT1(b); if (t >= lo && t <= hi && post[b] > bc) { bc = post[b]; bi = b; } }
+    return bi < 0 ? null : binT1(bi);
+  };
+  for (const [t, lab, col] of [[peakIn(900, 1700), 'WM', '#7cd6ff'], [peakIn(1700, 2600), 'GM', '#ffd479']]) {
+    if (!t) continue;
+    const x = xOf(t);
+    ctx.strokeStyle = col; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, H - pad); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = col; ctx.fillText(`${lab} ~${Math.round(t)}`, Math.min(x + 4, W - 74), top + 6);
+  }
 }
 
 function showView(key) {
-  curKey = ({ t1: 't1', t1u: 't1u', b1: 'b1', uni: 'uni' })[key] || 't1';
-  const o = outputs[curKey];
+  const o = outputs[key];
   if (!o) return;
+  curKey = key;
   $('#viewStat').textContent = `${o.label} · ${o.dims.join('×')} · window [${o.range[0]}, ${o.range[1]}]`;
   drawSlices(o);
   drawHistogram(o);
 }
 $('#viewSel').onchange = () => showView($('#viewSel').value);
-$('#cmapSel').onchange = () => showView(curKey === 't1u' ? 't1u' : curKey === 'b1' ? 'b1' : curKey === 'uni' ? 'uni' : 't1');
+$('#cmapSel').onchange = () => showView(curKey);
 $('#slice').oninput = () => { const o = outputs[curKey]; if (o) drawSlices(o); };
 
-log('Ready. Drop UNI + INV2 + (SA2RAGE or B1 map). Everything runs locally.');
+refreshRunState();
+log('Ready. Drop files or DICOM folders, pick a task, and Compute. Everything runs locally.');

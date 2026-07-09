@@ -77,15 +77,16 @@
     white-space:pre-wrap;max-height:150px;overflow:auto;margin-top:10px}
   #viewerWrap{display:none}
   #slices{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;align-items:flex-start}
-  #slices canvas{background:#000;border-radius:8px;image-rendering:pixelated;height:280px;width:auto;max-width:100%;border:1px solid var(--line)}
-  #hist{background:var(--bg2);border:1px solid var(--line);border-radius:8px;width:100%;height:120px;margin-top:12px}
+  #slices canvas{background:#000;border-radius:8px;image-rendering:pixelated;height:190px;width:auto;max-width:100%;border:1px solid var(--line)}
+  #hist{background:var(--bg2);border:1px solid var(--line);border-radius:8px;width:100%;height:132px;margin-top:12px}
   #slice{width:100%;margin-top:10px;accent-color:var(--accent)}
   .downloads a{display:inline-block;margin:4px 8px 0 0;color:var(--accent);text-decoration:none;font-size:13px;
     border:1px solid var(--line);border-radius:7px;padding:6px 11px;background:var(--panel2)}
   .downloads a:hover{border-color:var(--accent)}
   .note{color:var(--dim);font-size:12px}
   .pill{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
-  .example img{width:100%;border-radius:10px;border:1px solid var(--line);display:block}
+  .example{text-align:center}
+  .example img{width:100%;max-width:720px;border-radius:10px;border:1px solid var(--line);display:block;margin:0 auto}
   details.mini summary{cursor:pointer;color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.06em}
   .hidden{display:none}
   h3.sub{margin:6px 0;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
@@ -111,6 +112,10 @@
     scan or a separately acquired <b>B1 map</b> (e.g. a Siemens tfl B1 map). It is a Rust→WebAssembly port
     of the T1-mapping parts of <a href="https://github.com/JosePMarques/MP2RAGE-related-scripts">J. P. Marques'
     scripts</a>, validated to match the reference pipeline to machine precision.</p>
+    <p><b>Outputs.</b> B1-corrected T1 map (ms), the uncorrected T1 map, a <b>relative B1 map</b>
+    (computed from your SA2RAGE — a standalone output you can keep), the B1-corrected UNI, and a
+    <code>parameters.json</code>. The result panel overlays a pre/post (uncorrected vs corrected) T1
+    histogram, and everything downloads as NIfTI.</p>
     <p><b>Privacy.</b> Everything runs inside this browser tab via WebAssembly. Your images are never
     uploaded to any server — there is no server. You can disconnect from the network and it still works.</p>
     <p><b>How to use.</b> (1) Drop your NIfTI files and tag their roles. (2) Confirm the sequence parameters
@@ -125,7 +130,7 @@
 
 <main>
   <div class="card example">
-    <h2>Example output <span class="i" data-tip="A synthetic phantom processed by this exact pipeline: the UNI input, the B1-corrected T1 map (ms), the relative B1 field, and the brain T1 histogram.">i</span></h2>
+    <h2>Example T1 map <span class="i" data-tip="A B1-corrected T1 map (ms) from a de-identified (defaced) 7T MP2RAGE dataset, shown with the pre/post — uncorrected vs B1-corrected — tissue T1 histogram.">i</span></h2>
     <img src="./assets/example.png" alt="Example: UNI, B1-corrected T1 map, B1 map, and T1 histogram">
   </div>
 
@@ -138,6 +143,11 @@
       <span class="note">UNI, INV2, and either a SA2RAGE (2-vol) or a B1 map. DICOM headers auto-fill roles &amp; parameters; <code>.json</code> sidecars do the same for NIfTI. Nothing is uploaded.</span>
       <input id="file" type="file" multiple accept=".nii,.nii.gz,.json" class="hidden">
     </div>
+    <div class="row" style="justify-content:center;margin-top:12px">
+      <button class="secondary" id="pickFolder" type="button">📁 Choose DICOM folder(s)…</button>
+      <input id="folder" type="file" webkitdirectory directory multiple class="hidden">
+      <span class="note">the folder picker is the most reliable way to import DICOM series</span>
+    </div>
     <table id="filetable" class="hidden">
       <thead><tr><th>File</th><th>Dimensions</th><th>Role</th><th></th></tr></thead>
       <tbody></tbody>
@@ -148,11 +158,20 @@
     <h2><span class="step">2</span>Sequence parameters
       <span class="i" data-tip="These describe your acquisition and drive the T1 lookup. Use the 7T/3T presets or type your own. TRFLASH (GRE readout TR) is not stored in DICOM — confirm it from your protocol. NZslices = slices-per-slab × [partialFourier − 0.5, 0.5].">i</span>
     </h2>
-    <div class="row presets" style="margin-bottom:10px">
+    <div class="row" style="margin-bottom:10px;gap:10px;align-items:flex-end">
+      <div class="field"><label>Parameters from
+        <span class="i" data-tip="JSON sidecars: read TI/flip/TR from dropped dcm2niix .json files. Image headers: from DICOM (auto-filled on import). Manual: type them / use a preset.">i</span></label>
+        <select id="paramSource">
+          <option value="json">JSON sidecars</option>
+          <option value="dicom">Image headers (DICOM)</option>
+          <option value="manual">Manual / preset</option>
+        </select>
+      </div>
+      <button class="secondary" id="reloadJson" type="button" title="Re-read parameters from the uploaded .json sidecars">↻ Reload from JSONs</button>
       <span class="note">Preset:</span>
-      <button class="secondary" data-preset="7T">7T (UQ)</button>
-      <button class="secondary" data-preset="3T">3T</button>
-      <span id="paramSource" class="pill">defaults</span>
+      <button class="secondary presetbtn" data-preset="7T">7T</button>
+      <button class="secondary presetbtn" data-preset="3T">3T</button>
+      <span id="paramSrcNote" class="pill">defaults</span>
     </div>
     <h3 class="sub">MP2RAGE</h3>
     <div class="grid" id="mpGrid"></div>
@@ -172,11 +191,21 @@
 
   <div class="card">
     <h2><span class="step">3</span>Run
-      <span class="i" data-tip="Computation runs in a background Web Worker (WASM) so the page stays responsive. Nothing leaves your machine.">i</span>
+      <span class="i" data-tip="Pick a task, then Compute. Runs in a background Web Worker (WASM) so the page stays responsive. Nothing leaves your machine.">i</span>
     </h2>
-    <div class="row">
-      <button id="run" disabled>Compute T1 map</button>
-      <span id="status" class="note">Add a UNI and a B1 source (SA2RAGE or B1 map) to enable.</span>
+    <div class="row" style="align-items:flex-end;gap:10px">
+      <div class="field"><label>Task
+        <span class="i" data-tip="T1 map: B1-corrected T1 from MP2RAGE (needs UNI + INV2 + a B1 source). SA2RAGE→B1 map: just the relative B1 map. Denoise: robust-combination UNI→UNI-DEN (needs UNI + INV1 + INV2).">i</span></label>
+        <select id="taskSel">
+          <option value="t1">Make T1 map from MP2RAGE</option>
+          <option value="b1only">SA2RAGE → B1 map</option>
+          <option value="denoise">Denoise UNI → UNI-DEN</option>
+        </select>
+      </div>
+      <div class="field" id="regField" style="display:none"><label>Denoise strength</label>
+        <input id="reg" type="number" value="6" step="1" min="1" title="noise regularization β multiplier (larger = cleaner background)"></div>
+      <button id="run" disabled>Compute</button>
+      <span id="status" class="note">Add inputs to enable.</span>
     </div>
     <div id="progress" style="margin-top:12px"><div></div></div>
     <div id="log"></div>

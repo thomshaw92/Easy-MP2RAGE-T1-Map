@@ -17,12 +17,23 @@ venv/
 **/pkg/
 web/wasm/
 
-# outputs / data
+# outputs / imaging data — never commit subject/patient data
+/data/
+data/
 derivatives/
+sample_data/
+test_data/
+testdata/
+*_defaced*/
 *.nii
 *.nii.gz
 *.IMA
+*.ima
 *.dcm
+*.dicom
+sub-*.json
+*.bval
+*.bvec
 qc/
 work/
 *.png
@@ -32,6 +43,8 @@ work/
 .idea/
 .vscode/
 
-# committed synthetic test fixtures (deterministic, no PHI) — re-include despite *.nii.gz above
+# committed page assets (example images) + synthetic fixtures — re-include despite the ignores above
+!web/assets/
+!web/assets/*.png
 !tools/phantom/
 !tools/phantom/*.nii.gz

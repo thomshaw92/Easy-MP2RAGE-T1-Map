@@ -11,6 +11,7 @@
 use ndarray::Array3;
 use wasm_bindgen::prelude::*;
 
+use mp2rage_core::denoise;
 use mp2rage_core::dicom;
 use mp2rage_core::model::{Mp2rageParams, Sa2rageParams};
 use mp2rage_core::pipeline::{run_b1map, run_sa2rage};
@@ -224,6 +225,49 @@ pub fn parse_dicom_series(concat: &[u8], offsets: &[u32]) -> Result<DicomVolume,
         role: s.role,
         params,
     })
+}
+
+/// A derived DICOM series: all files concatenated, delimited by `offsets`.
+#[wasm_bindgen]
+pub struct DicomOut {
+    data: Vec<u8>,
+    offsets: Vec<u32>,
+}
+#[wasm_bindgen]
+impl DicomOut {
+    #[wasm_bindgen(getter)]
+    pub fn data(&self) -> Vec<u8> { self.data.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn offsets(&self) -> Vec<u32> { self.offsets.clone() }
+}
+
+/// Write a derived T1 (ms) DICOM series from the source DICOM bytes (`concat` +
+/// `offsets`, as passed to `parse_dicom_series`) and the computed T1 volume
+/// (i-fastest, on the source grid). `salt` makes the generated UIDs unique.
+#[wasm_bindgen]
+pub fn write_dicom_t1(concat: &[u8], offsets: &[u32], t1: &[f32], dims: &[u32], salt: &str) -> Result<DicomOut, JsValue> {
+    let sources: Vec<&[u8]> = offsets.windows(2).filter_map(|w| {
+        let (s, e) = (w[0] as usize, w[1] as usize);
+        if e <= concat.len() && s < e { Some(&concat[s..e]) } else { None }
+    }).collect();
+    let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
+    let files = dicom::write_derived_series(&sources, t1, nx, ny, nz, salt).map_err(|e| JsValue::from_str(&e))?;
+    let mut data = Vec::new();
+    let mut offs = vec![0u32];
+    for f in &files {
+        data.extend_from_slice(f);
+        offs.push(data.len() as u32);
+    }
+    Ok(DicomOut { data, offsets: offs })
+}
+
+/// Denoise a UNI (O'Brien robust combination) -> UNI-DEN. Flat i-fastest arrays;
+/// `mf` is the noise regularization multiplier. Returns the denoised UNI (0..4095).
+#[wasm_bindgen]
+pub fn denoise_uni(uni: &[f32], inv1: &[f32], inv2: &[f32], dims: &[u32], mf: f64) -> Vec<f32> {
+    let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
+    let out = denoise::robust_combination(&arr3(uni, nx, ny, nz), &arr3(inv1, nx, ny, nz), &arr3(inv2, nx, ny, nz), mf);
+    flat_ifast(&out)
 }
 
 /// Library version string (for the UI footer / provenance).

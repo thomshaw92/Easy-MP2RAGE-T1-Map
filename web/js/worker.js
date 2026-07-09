@@ -3,7 +3,7 @@
 // results are posted back with transferable ArrayBuffers (zero-copy).
 //
 // The .wasm is built by `wasm-pack build --target web` and copied to web/wasm/.
-import init, { t1map_sa2rage, t1map_b1, version } from '../wasm/mp2rage_wasm.js';
+import init, { t1map_sa2rage, t1map_b1, denoise_uni, version } from '../wasm/mp2rage_wasm.js';
 
 const ready = init(new URL('../wasm/mp2rage_wasm_bg.wasm', import.meta.url));
 
@@ -17,6 +17,13 @@ self.onmessage = async (e) => {
     }
     self.postMessage({ type: 'progress', stage: 'computing', pct: 5 });
     const t0 = performance.now();
+
+    if (msg.mode === 'denoise') {
+      const denoised = denoise_uni(msg.uni, msg.inv1, msg.inv2, msg.dims, msg.reg);
+      const out = { type: 'result', denoised, dims: msg.dims, ms: performance.now() - t0 };
+      self.postMessage(out, [out.denoised.buffer]);
+      return;
+    }
 
     let res;
     if (msg.mode === 'sa2rage') {
