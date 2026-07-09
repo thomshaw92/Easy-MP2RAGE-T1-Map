@@ -240,19 +240,24 @@ async function addDicomFolder(name, files) {
 
 async function handleDrop(e) {
   const dt = e.dataTransfer;
+  // Capture every entry synchronously — dataTransfer.items is emptied once this
+  // handler returns, so we must grab all of them before the first await.
   const entries = dt.items ? [...dt.items].map((it) => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean) : [];
   if (!entries.length) { if (dt.files?.length) await addFiles(dt.files); return; }
-  const niftis = [], loose = [], folders = [];
-  for (const en of entries) {
-    if (en.isDirectory) folders.push(en);
-    else if (en.isFile) {
-      const f = await getFile(en);
-      (/\.(nii(\.gz)?|json)$/i.test(f.name) ? niftis : loose).push(f);
-    }
-  }
+  const folders = entries.filter((en) => en.isDirectory);
+  const fileEntries = entries.filter((en) => en.isFile);
+  if (folders.length > 1) log(`${folders.length} folders dropped — importing each as its own series …`);
+  // loose dropped files (NIfTI/JSON vs. stray DICOM files)
+  const dropped = await Promise.all(fileEntries.map(getFile));
+  const niftis = dropped.filter((f) => /\.(nii(\.gz)?|json)$/i.test(f.name));
+  const loose = dropped.filter((f) => !/\.(nii(\.gz)?|json)$/i.test(f.name));
   if (niftis.length) await addFiles(niftis);
   if (loose.length) await addDicomFolder('(dropped files)', loose);
-  for (const dir of folders) await addDicomFolder(dir.name, await collectFiles(dir));
+  // Import every dropped folder; isolate failures so one bad series can't block the rest.
+  for (const dir of folders) {
+    try { await addDicomFolder(dir.name, await collectFiles(dir)); }
+    catch (err) { log(`  ${dir.name}: ${err}`); }
+  }
 }
 
 // drag & drop

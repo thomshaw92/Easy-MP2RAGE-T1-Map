@@ -121,7 +121,10 @@
     histogram; download each as NIfTI (plus a derived DICOM T1 series), or grab them all at once as a
     single <code>.zip</code>.</p>
     <p><b>Privacy.</b> Everything runs inside this browser tab via WebAssembly. Your images are never
-    uploaded to any server — there is no server. You can disconnect from the network and it still works.</p>
+    uploaded to any server — there is no server. You can disconnect from the network and it still works.
+    (If you use the folder picker, Chrome shows an &ldquo;upload… only continue if you trust this site&rdquo;
+    prompt — that is Chrome&rsquo;s wording for granting the page <em>read</em> access to a folder on your
+    disk, not a network upload. Drag &amp; drop skips it.)</p>
     <p><b>How to use.</b> (1) Drop your NIfTI files or DICOM folders and tag their roles. (2) Confirm the
     sequence parameters — from JSON sidecars, DICOM headers, or a 7T/3T preset. (3) Pick a task
     (<b>T1 map</b>, <b>SA2RAGE → B1 map</b>, or <b>UNI denoising</b>) and Compute, then preview and
@@ -144,14 +147,14 @@
       <span class="i" data-tip="Drag &amp; drop whole DICOM series folders (uncompressed Siemens) — roles and sequence parameters are read from the headers — or .nii / .nii.gz files (with optional dcm2niix .json sidecars). Everything stays on your computer.">i</span>
     </h2>
     <div id="drop">
-      <b>Drag &amp; drop</b> your <b>DICOM folders</b> or <b>.nii / .nii.gz</b> files here — or click to browse.<br>
-      <span class="note">UNI, INV2, and either a SA2RAGE (2-vol) or a B1 map. DICOM headers auto-fill roles &amp; parameters; <code>.json</code> sidecars do the same for NIfTI. Nothing is uploaded.</span>
+      <b>Drag &amp; drop</b> your <b>DICOM folders</b> — <b>drop several at once</b> — or <b>.nii / .nii.gz</b> files here. (Click to browse for NIfTI files.)<br>
+      <span class="note">UNI, INV2, and either a SA2RAGE (2-vol) or a B1 map. DICOM headers auto-fill roles &amp; parameters; <code>.json</code> sidecars do the same for NIfTI. Drag &amp; drop is the best way to add several series at once, and it never shows a browser &ldquo;upload&rdquo; prompt. Nothing is uploaded &mdash; there is no server.</span>
       <input id="file" type="file" multiple accept=".nii,.nii.gz,.json" class="hidden">
     </div>
     <div class="row" style="justify-content:center;margin-top:12px">
-      <button class="secondary" id="pickFolder" type="button">📁 Choose DICOM folder(s)…</button>
+      <button class="secondary" id="pickFolder" type="button">📁 Choose a DICOM folder…</button>
       <input id="folder" type="file" webkitdirectory directory multiple class="hidden">
-      <span class="note">the folder picker is the most reliable way to import DICOM series</span>
+      <span class="note">Fallback if drag &amp; drop won&rsquo;t work. Picks one folder at a time (or a parent folder containing several series). Chrome shows an &ldquo;upload&rdquo; permission prompt for folders &mdash; that is just its wording for letting the page <em>read</em> the folder; nothing is sent anywhere. Drag &amp; drop avoids the prompt.</span>
     </div>
     <table id="filetable" class="hidden">
       <thead><tr><th>File</th><th>Dimensions</th><th>Role</th><th></th></tr></thead>
