@@ -36,10 +36,24 @@
   .step{display:inline-grid;place-items:center;width:22px;height:22px;
     background:linear-gradient(135deg,var(--accent),var(--accent2));color:#08101c;border-radius:50%;
     font-weight:800;font-size:12px;margin-right:9px}
-  /* info tooltip */
-  .i{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
-    border:1px solid var(--line);color:var(--dim);font-size:11px;font-style:italic;cursor:help;position:relative;margin-left:8px}
+  /* info tooltip — upright bold serif "i" so it reads as info, not a slash */
+  .i{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;
+    border:1px solid var(--line);color:var(--dim);font:700 12px/1 Georgia,"Times New Roman",serif;
+    cursor:help;position:relative;margin-left:8px;vertical-align:middle;flex:none;user-select:none}
   .i:hover{color:var(--ink);border-color:var(--accent)}
+  /* clickable input filename (preview) + import warnings banner */
+  .clickname{cursor:pointer;color:var(--ink);white-space:nowrap}
+  .clickname:hover span{text-decoration:underline;color:var(--accent)}
+  #warnings{display:none;margin-top:12px;padding:10px 12px;border-radius:9px;
+    background:rgba(240,176,58,.10);border:1px solid rgba(240,176,58,.42);color:#f0d69a;font-size:13px;line-height:1.5}
+  #warnings div{margin:3px 0}
+  #warnings b{color:#ffe3a3}
+  .reset{margin-left:12px;background:transparent;border:1px solid rgba(255,120,120,.5);color:#ffb0b0}
+  .reset:hover{background:rgba(255,120,120,.12);border-color:#ff8080}
+  #stop{background:transparent;border:1px solid var(--line);color:var(--ink)}
+  #stop:hover{border-color:#ff8080;color:#ffb0b0}
+  .chk{display:inline-flex;align-items:center;gap:7px;color:var(--ink);font-size:13px;cursor:pointer;user-select:none}
+  .chk input{width:15px;height:15px}
   .i:hover::after{content:attr(data-tip);position:absolute;left:0;top:150%;
     background:#0a0d11;border:1px solid var(--line);color:var(--ink);padding:9px 11px;border-radius:9px;
     width:280px;font:400 12px/1.5 -apple-system,sans-serif;text-transform:none;letter-spacing:normal;
@@ -101,6 +115,7 @@
       <div class="tag">Turn your MP2RAGE scans into quantitative <b>T1 maps</b> — corrected for B1 (from SA2RAGE or a B1 map) — and clean up the UNI background with <b>denoising</b>. 3T &amp; 7T.</div>
     </div>
     <span class="badge" title="Nothing is uploaded. Processing happens locally in this browser tab.">🔒 100% in your browser — no data leaves your computer</span>
+    <button class="secondary reset" id="resetAll" title="Reset everything: clears all loaded images, JSON sidecars, sequence parameters and results, and returns the app to its initial state. Nothing is uploaded or deleted from your disk — this only clears what is loaded in the page.">↺ Reset all</button>
   </div>
 </header>
 
@@ -157,9 +172,10 @@
       <span class="note">Fallback if drag &amp; drop won&rsquo;t work. Picks one folder at a time (or a parent folder containing several series). Chrome shows an &ldquo;upload&rdquo; permission prompt for folders &mdash; that is just its wording for letting the page <em>read</em> the folder; nothing is sent anywhere. Drag &amp; drop avoids the prompt.</span>
     </div>
     <table id="filetable" class="hidden">
-      <thead><tr><th>File</th><th>Dimensions</th><th>Role</th><th></th></tr></thead>
+      <thead><tr><th>File <span class="note">(👁 click to preview)</span></th><th>Dimensions</th><th>Role</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
+    <div id="warnings"></div>
   </div>
 
   <div class="card">
@@ -194,6 +210,10 @@
         <span class="i" data-tip="A generic Siemens B1 map. 'tfl' = FLIP ANGLE MAP storing achieved flip ×10 (ref flip default 80°); 'percent' = % of nominal; 'relative' = already 1.0 = nominal.">i</span>
       </h3>
       <div class="grid" id="b1Grid"></div>
+      <label class="chk" style="margin-top:10px">
+        <input type="checkbox" id="extendFov" checked> Extend B1 map to the full brain FOV
+        <span class="i" data-tip="If the B1 map covers a smaller field-of-view than the MP2RAGE (common for a low-res tfl B1 map), brain voxels outside it get no correction. B1⁺ transmit fields are spatially smooth, so this fits a low-order 3-D polynomial to the measured field and uses it to fill those voxels. Measured voxels are kept unchanged; filled regions are smooth estimates — check the B1 map output.">i</span>
+      </label>
     </div>
   </div>
 
@@ -213,6 +233,11 @@
       <div class="field" id="regField" style="display:none"><label>Denoise strength</label>
         <input id="reg" type="number" value="6" step="1" min="1" title="noise regularization β multiplier (larger = cleaner background)"></div>
       <button id="run" disabled>Compute</button>
+      <button id="stop" type="button" style="display:none" title="Stop the current run. Your loaded inputs and parameters are kept — you can run again.">■ Stop</button>
+      <label class="chk" title="Log extra detail — parameters, processing stages and output statistics — while computing.">
+        <input type="checkbox" id="verbose"> Verbose log
+        <span class="i" data-tip="When on, the log below shows the exact parameters used, each processing stage as it runs, and summary statistics of every output.">i</span>
+      </label>
       <span id="status" class="note">Add inputs to enable.</span>
     </div>
     <div id="progress" style="margin-top:12px"><div></div></div>

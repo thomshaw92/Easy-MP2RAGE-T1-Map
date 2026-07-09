@@ -80,6 +80,7 @@ fn b1map_pipeline_matches_golden() {
         "tfl",
         80.0,
         &mp(),
+        false, // extend_fov off → bit-parity with the Python golden
     );
     assert_close("B1map T1_corr(ms)", &out.t1_corr, &golden("v_b1map_corr_T1_ms"), 1e-6, 1e-4);
     assert_close("B1map UNI_corr", &out.uni_corr, &golden("v_b1map_corr_UNI"), 0.0, 0.0);

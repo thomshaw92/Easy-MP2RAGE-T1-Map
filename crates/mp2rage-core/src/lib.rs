@@ -2,6 +2,7 @@
 //! T1-mapping pipeline. Native-testable against golden files (see
 //! `tests/parity.rs`) and reused verbatim by the WASM build.
 
+pub mod b1fill;
 pub mod correct;
 pub mod denoise;
 pub mod dicom;

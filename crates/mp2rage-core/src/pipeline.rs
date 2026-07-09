@@ -157,6 +157,7 @@ pub fn run_b1map(
     kind: &str,
     ref_angle: f64,
     mp: &Mp2rageParams,
+    extend_fov: bool,
 ) -> Outputs {
     let dim = uni.dim();
     let mask = brain_mask(inv2, 0.12);
@@ -173,7 +174,15 @@ pub fn run_b1map(
     // b1-map branch smooths in f32 (matches pipeline.py .astype(float32) before gaussian)
     let rel_f = rel.mapv(|v| if v.is_finite() { v } else { med });
     let rel_g = gaussian_filter3(&rel_f, 1.0, true).mapv(|v| v as f32);
-    let b1_grid = resample_to(&rel_g, b1_aff, dim, uni_aff, f64::NAN).mapv(|v| v as f64);
+    // Resample with NaN outside the measured B1 FOV so those voxels are distinct
+    // from genuine low-B1 measurements.
+    let mut b1_grid = resample_to(&rel_g, b1_aff, dim, uni_aff, f64::NAN).mapv(|v| v as f64);
+
+    // Optionally extend a too-small B1 FOV to cover the whole brain by fitting a
+    // smooth low-order polynomial to the measured field (B1⁺ is slowly varying).
+    if extend_fov {
+        b1_grid = crate::b1fill::extend_b1_fov(&b1_grid, &mask, 3, (0.3, 2.0));
+    }
 
     let b1_in = b1_grid.mapv(|v| if v.is_nan() { 0.0 } else { v });
     let res = t1b1_correct_with_b1map(uni, &b1_in, mp, &mask);

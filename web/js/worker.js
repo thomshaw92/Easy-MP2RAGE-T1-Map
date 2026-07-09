@@ -15,16 +15,25 @@ self.onmessage = async (e) => {
       self.postMessage({ type: 'ready', version: version() });
       return;
     }
-    self.postMessage({ type: 'progress', stage: 'computing', pct: 5 });
+    self.postMessage({ type: 'progress', stage: 'reading inputs into the WASM core', pct: 8 });
     const t0 = performance.now();
 
     if (msg.mode === 'denoise') {
+      self.postMessage({ type: 'progress', stage: 'robust-combination denoising (single WASM pass)', pct: 20 });
       const denoised = denoise_uni(msg.uni, msg.inv1, msg.inv2, msg.dims, msg.reg);
       const out = { type: 'result', denoised, dims: msg.dims, ms: performance.now() - t0 };
+      self.postMessage({ type: 'progress', stage: `WASM finished in ${(out.ms).toFixed(0)} ms`, pct: 75 });
       self.postMessage(out, [out.denoised.buffer]);
       return;
     }
 
+    self.postMessage({
+      type: 'progress',
+      stage: msg.mode === 'sa2rage'
+        ? 'SA2RAGE→B1 + iterative B1 correction (heavy WASM step)'
+        : 'B1-map resample + correction (heavy WASM step)',
+      pct: 20,
+    });
     let res;
     if (msg.mode === 'sa2rage') {
       res = t1map_sa2rage(
@@ -36,7 +45,7 @@ self.onmessage = async (e) => {
       res = t1map_b1(
         msg.uni, msg.inv2, msg.b1,
         msg.dims, msg.uniAff, msg.b1Dims, msg.b1Aff,
-        msg.kind, msg.refAngle, msg.mp,
+        msg.kind, msg.refAngle, msg.mp, !!msg.extendFov,
       );
     } else {
       throw new Error(`unknown mode: ${msg.mode}`);
@@ -51,6 +60,7 @@ self.onmessage = async (e) => {
       dims: res.dims,
       ms: performance.now() - t0,
     };
+    self.postMessage({ type: 'progress', stage: `WASM finished in ${out.ms.toFixed(0)} ms`, pct: 75 });
     self.postMessage(out, [out.t1.buffer, out.b1.buffer, out.uni_corr.buffer, out.t1_uncorr.buffer]);
   } catch (err) {
     self.postMessage({ type: 'error', message: String(err && err.stack ? err.stack : err) });

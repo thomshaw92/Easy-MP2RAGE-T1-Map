@@ -74,7 +74,14 @@ const state = { files: [], jsons: [] };
 function guessRole(name) {
   const n = name.toLowerCase();
   if (/sa2rage|sa2/.test(n)) return 'SA2RAGE';
-  if (/b1map|_b1|flip.?angle|tfl/.test(n)) return 'B1 map';
+  // A Siemens TFL B1 map (TB1TFL / tfl_b1map) produces TWO series: an anatomical
+  // reference and the flip-angle map. Only the flip-angle map ("famp") is the B1
+  // map; the anatomical image ("anat") must not be used for correction.
+  if (/tb1tfl|b1map|_b1\b|flip.?angle|tfl/.test(n)) {
+    if (/famp|flip.?angle|fa[_-]?map/.test(n)) return 'B1 map';
+    if (/anat/.test(n)) return '(ignore)';
+    return 'B1 map';
+  }
   if (/uni/.test(n)) return 'UNI';
   if (/inv-?2|inv2/.test(n)) return 'INV2';
   if (/inv-?1|inv1/.test(n)) return 'INV1';
@@ -131,7 +138,14 @@ function renderTable() {
   const tb = $('#filetable tbody'); tb.innerHTML = '';
   for (const [i, f] of state.files.entries()) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${f.name}</td><td class="dim">${f.dims.join(' × ')}</td>`;
+    const nameTd = document.createElement('td');
+    nameTd.className = 'clickname';
+    nameTd.title = 'click to preview this image in the viewer';
+    nameTd.innerHTML = `👁 <span>${esc(f.name)}</span>`;
+    nameTd.onclick = () => previewInput(f);
+    tr.appendChild(nameTd);
+    const dimTd = document.createElement('td'); dimTd.className = 'dim'; dimTd.textContent = f.dims.join(' × ');
+    tr.appendChild(dimTd);
     const roleTd = document.createElement('td');
     const sel = document.createElement('select');
     for (const r of ROLES) { const o = document.createElement('option'); o.value = o.textContent = r; if (r === f.role) o.selected = true; sel.appendChild(o); }
@@ -154,9 +168,56 @@ function renderTable() {
     tb.appendChild(tr);
   }
   $('#filetable').classList.toggle('hidden', state.files.length === 0 && state.jsons.length === 0);
+  renderWarnings();
 }
 
 function byRole(r) { return state.files.find((f) => f.role === r); }
+
+// ---- import sanity checks (ND / duplicates / B1 anat-vs-famp) --------------
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+// DICOM ImageType (0008,0008) tokens for a file — from the DICOM header, or from
+// a matching dcm2niix .json sidecar for a NIfTI. Returns an UPPERCASE array or null.
+function imageTypeTokens(f) {
+  if (f.imageType) return f.imageType.toUpperCase().split('\\').map((s) => s.trim()).filter(Boolean);
+  const base = f.name.replace(/\.(nii\.gz|nii)$/i, '').toLowerCase();
+  const j = state.jsons.find((x) => x.name.replace(/\.json$/i, '').toLowerCase() === base);
+  if (j && Array.isArray(j.json.ImageType)) return j.json.ImageType.map((s) => String(s).toUpperCase().trim());
+  return null;
+}
+// Non-distortion-corrected? ImageType has ND and no DIS2D/DIS3D; else name ends _ND.
+function isNonDistCorrected(f) {
+  const t = imageTypeTokens(f);
+  if (t) return t.includes('ND') && !t.some((x) => x.startsWith('DIS'));
+  return /_nd(?=[._-]|$)/i.test(f.name.replace(/\.(nii\.gz|nii)$/i, ''));
+}
+
+function renderWarnings() {
+  const box = $('#warnings'); if (!box) return;
+  const msgs = [];
+  const structural = new Set(['UNI', 'INV1', 'INV2']);
+  // 1) non-distortion-corrected structural inputs
+  for (const f of state.files) {
+    if (structural.has(f.role) && isNonDistCorrected(f))
+      msgs.push(`“${esc(f.name)}” is a <b>non-distortion-corrected (_ND)</b> image but is set to <b>${f.role}</b>. For quantitative T1 prefer the distortion-corrected (DIS2D/DIS3D) series. <b>Please check!</b>`);
+  }
+  // 2) more than one image assigned to the same role
+  const byrole = {};
+  for (const f of state.files) if (f.role !== '(ignore)') (byrole[f.role] ||= []).push(f);
+  for (const [role, fs] of Object.entries(byrole))
+    if (fs.length > 1)
+      msgs.push(`<b>${fs.length} images are set to ${role}</b> (${fs.map((f) => esc(f.name)).join(', ')}). Only one is used — check you picked the right one.`);
+  // 3) a B1 sequence's anatomical reference mistaken for the flip-angle (B1) map
+  for (const f of state.files) {
+    const t = imageTypeTokens(f);
+    const isFAM = t && t.includes('FLIP ANGLE MAP');
+    const looksAnat = /b1map|tb1tfl|tfl.?b1/i.test(f.name + ' ' + (f.seriesDesc || '')) && t && !isFAM && (t.includes('M') || t.includes('MAGNITUDE'));
+    if (f.role === 'B1 map' && looksAnat)
+      msgs.push(`“${esc(f.name)}” looks like the B1 sequence’s <b>anatomical reference</b>, not the flip-angle (B1) map. Use the <b>FLIP ANGLE MAP</b> series (usually “famp”) as the B1 map.`);
+  }
+  box.innerHTML = msgs.map((m) => `<div>⚠ ${m}</div>`).join('');
+  box.style.display = msgs.length ? 'block' : 'none';
+}
 
 function refreshRunState() {
   const uni = byRole('UNI'), inv1 = byRole('INV1'), inv2 = byRole('INV2'), sa = byRole('SA2RAGE'), b1 = byRole('B1 map');
@@ -224,8 +285,9 @@ async function addDicomFolder(name, files) {
   try { v = parse_dicom_series(concat, offsets); }
   catch (e) { log(`  ${name}: ${e}`); return; }
   const dims = Array.from(v.dims);
-  state.files.push({ name, dims, affine: v.affine, data: v.data, role: v.role, dicom: true, src: { concat, offsets } });
-  log(`  ${name} → [${dims.join('×')}] role ${v.role}`);
+  state.files.push({ name, dims, affine: v.affine, data: v.data, role: v.role, dicom: true,
+    imageType: v.image_type, seriesDesc: v.series_desc, src: { concat, offsets } });
+  log(`  ${name} → [${dims.join('×')}] role ${v.role}${v.image_type ? '  [' + v.image_type + ']' : ''}`);
   const params = Array.from(v.params);
   if (params.length === 7) {
     ['mp_tr', 'mp_ti1', 'mp_ti2', 'mp_fa1', 'mp_fa2', 'mp_nz1', 'mp_nz2'].forEach((id, i) => {
@@ -288,51 +350,117 @@ $('#pickFolder').onclick = () => $('#folder').click();
 $('#folder').onchange = (e) => addPickedFolders(e.target.files);
 
 // ---- run -------------------------------------------------------------------
-let worker;
-function getWorker() {
-  if (!worker) worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+let worker = null;
+let running = false;
+
+// A fresh worker per run gives a clean WASM linear-memory heap — the large f64
+// intermediates from a previous run are freed with the old instance. This is the
+// "clear cache" that stops re-runs from exhausting memory and crashing.
+function freshWorker() {
+  if (worker) { try { worker.terminate(); } catch (e) { /* ignore */ } }
+  worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+  worker.onerror = (e) => { log('✖ worker error: ' + (e.message || e)); stopProcessing(); };
   return worker;
 }
 
 const outputs = {}; // key -> {data, dims, affine, label, range, cmap}
+function clearOutputs() { for (const k of Object.keys(outputs)) delete outputs[k]; }
+
+// Reset the run UI (after a result, an error, or Stop).
+function finishRun() {
+  running = false;
+  $('#stop').style.display = 'none';
+  refreshRunState(); // restores the correct Run label / enabled state
+}
+
+// Stop the current run: terminate the worker (aborts in-flight WASM), keep inputs.
+function stopProcessing(msg) {
+  if (worker) { try { worker.terminate(); } catch (e) { /* ignore */ } worker = null; }
+  finishRun();
+  $('#progress').style.display = 'none'; setProgress(0);
+  if (msg) log(msg);
+}
+$('#stop').onclick = () => stopProcessing('■ stopped — inputs and parameters kept. Ready to run again.');
+
+// Full reset: clear all inputs, parameters, results and logs back to defaults.
+function resetAll() {
+  if ((state.files.length || state.jsons.length) &&
+      !confirm('Reset everything? This clears all loaded images, JSON sidecars, parameters and results.')) return;
+  stopProcessing();
+  state.files = []; state.jsons = [];
+  clearOutputs(); lastViews = null; curKey = 't1';
+  renderTable();
+  $('#viewerWrap').style.display = 'none';
+  $('#downloads').innerHTML = '';
+  const wb = $('#warnings'); if (wb) { wb.innerHTML = ''; wb.style.display = 'none'; }
+  logEl.textContent = '';
+  applyPreset('7T');
+  buildForm($('#b1Grid'), B1_SPEC, 'b1');
+  $('#paramSource').value = 'manual'; $('#paramSrcNote').textContent = 'manual';
+  $('#taskSel').value = 't1';
+  if ($('#extendFov')) $('#extendFov').checked = true;
+  refreshRunState();
+  log('↺ reset — all inputs, parameters and results cleared.');
+}
+$('#resetAll').onclick = resetAll;
 
 $('#run').onclick = async () => {
   const { uni, inv1, inv2, sa, b1, mode, task } = refreshRunState();
-  if ($('#run').disabled || !uni) return;
+  if ($('#run').disabled || !uni || running) return;
+  running = true;
   $('#run').disabled = true;
+  $('#stop').style.display = '';
+  clearOutputs();
+  $('#downloads').innerHTML = '';
+  $('#viewerWrap').style.display = 'none';
   $('#progress').style.display = 'block'; setProgress(5);
   const t0 = performance.now();
   const dims = uni.dims.slice(0, 3);
-  const w = getWorker();
+  if ($('#verbose')?.checked) {
+    const roles = state.files.filter((f) => f.role !== '(ignore)').map((f) => `${f.role}=${f.name}`).join(', ');
+    log(`  [verbose] task=${task}  mode=${mode || '-'}  grid=${dims.join('×')}`);
+    log(`  [verbose] roles: ${roles || '(none)'}`);
+    log(`  [verbose] MP2RAGE [TR,TI1,TI2,FA1,FA2,NZ1,NZ2,TRFLASH,invEff] = ${mpParams().map((x) => +x.toFixed(4)).join(', ')}`);
+    if (mode === 'sa2rage') log(`  [verbose] SA2RAGE [TR,TD1,TD2,FA1,FA2,NZ1,NZ2,TRFLASH,avgT1] = ${saParams().map((x) => +x.toFixed(4)).join(', ')}`);
+    if (mode === 'b1map') log(`  [verbose] B1 map: kind=${$('#b1_type').value} refAngle=${num('#b1_refangle')}° extend-FOV=${$('#extendFov')?.checked}`);
+    if (task === 'denoise') log(`  [verbose] denoise β multiplier = ${num('#reg')}`);
+  }
+  const w = freshWorker();
+  w.onmessage = (e) => onResult(e.data, uni, task, mode, t0);
+  // Copy every array we post. postMessage transfers *detach* the source buffer,
+  // which would empty state.files and crash the next run. Copies keep the loaded
+  // inputs pristine and re-runnable.
+  const uniCopy = uni.data.slice();
   outputs.uni = { data: uni.data.slice(), dims, affine: uni.affine, label: 'UNI (input)', range: [0, 4095], cmap: 'gray' };
 
   if (task === 'denoise') {
     log('\n▶ denoise (robust combination) …');
-    const msg = { mode: 'denoise', uni: uni.data, inv1: inv1.data, inv2: inv2.data, dims: Uint32Array.from(dims), reg: num('#reg') };
-    w.onmessage = (e) => onResult(e.data, uni, task, mode, t0);
+    const inv1Copy = inv1.data.slice(), inv2Copy = inv2.data.slice();
+    const msg = { mode: 'denoise', uni: uniCopy, inv1: inv1Copy, inv2: inv2Copy, dims: Uint32Array.from(dims), reg: num('#reg') };
     setProgress(15);
-    try { w.postMessage(msg, [uni.data.buffer, inv1.data.buffer, inv2.data.buffer]); }
-    catch (err) { log('worker post failed: ' + err); $('#run').disabled = false; }
+    try { w.postMessage(msg, [uniCopy.buffer, inv1Copy.buffer, inv2Copy.buffer]); }
+    catch (err) { log('worker post failed: ' + err); stopProcessing(); }
     return;
   }
 
   log(`\n▶ ${task === 'b1only' ? 'SA2RAGE → B1 map' : mode + ' correction'} …`);
-  const inv2Data = inv2 ? inv2.data : uni.data;
-  const msg = { mode, uni: uni.data, inv2: inv2Data, dims: Uint32Array.from(dims), uniAff: uni.affine, mp: Float64Array.from(mpParams()) };
-  const transfer = [uni.data.buffer];
-  if (inv2) transfer.push(inv2.data.buffer);
+  const inv2Copy = inv2 ? inv2.data.slice() : uniCopy.slice();
+  const msg = { mode, uni: uniCopy, inv2: inv2Copy, dims: Uint32Array.from(dims), uniAff: uni.affine, mp: Float64Array.from(mpParams()) };
+  const transfer = [uniCopy.buffer, inv2Copy.buffer];
   if (mode === 'sa2rage') {
-    msg.sa = sa.data; msg.saDims = Uint32Array.from(sa.dims.slice(0, 3)); msg.saAff = sa.affine;
-    msg.saP = Float64Array.from(saParams()); transfer.push(sa.data.buffer);
+    const saCopy = sa.data.slice();
+    msg.sa = saCopy; msg.saDims = Uint32Array.from(sa.dims.slice(0, 3)); msg.saAff = sa.affine;
+    msg.saP = Float64Array.from(saParams()); transfer.push(saCopy.buffer);
   } else {
-    msg.b1 = b1.data; msg.b1Dims = Uint32Array.from(b1.dims.slice(0, 3)); msg.b1Aff = b1.affine;
+    const b1Copy = b1.data.slice();
+    msg.b1 = b1Copy; msg.b1Dims = Uint32Array.from(b1.dims.slice(0, 3)); msg.b1Aff = b1.affine;
     msg.kind = { tfl: 0, percent: 1, relative: 2 }[$('#b1_type').value]; msg.refAngle = num('#b1_refangle');
-    transfer.push(b1.data.buffer);
+    msg.extendFov = $('#extendFov') ? $('#extendFov').checked : true;
+    transfer.push(b1Copy.buffer);
   }
-  w.onmessage = (e) => onResult(e.data, uni, task, mode, t0);
   setProgress(15);
-  try { w.postMessage(msg, transfer.filter(Boolean)); }
-  catch (err) { log('worker post failed: ' + err); $('#run').disabled = false; }
+  try { w.postMessage(msg, transfer); }
+  catch (err) { log('worker post failed: ' + err); stopProcessing(); }
 };
 
 function setProgress(p) { $('#progress > div').style.width = p + '%'; }
@@ -345,8 +473,10 @@ function setupViews(list) {
 }
 
 async function onResult(res, uni, task, mode, t0) {
-  if (res.type === 'error') { log('✖ ' + res.message); $('#run').disabled = false; setProgress(0); return; }
-  if (res.type === 'progress') { setProgress(res.pct); return; }
+  if (!running) return; // stale message from a stopped/replaced worker
+  if (res.type === 'log') { if ($('#verbose')?.checked) log('  · ' + res.message); return; }
+  if (res.type === 'error') { log('✖ ' + res.message); $('#progress').style.display = 'none'; setProgress(0); finishRun(); return; }
+  if (res.type === 'progress') { setProgress(res.pct); if (res.stage && $('#verbose')?.checked) log('  · ' + res.stage); return; }
   if (res.type !== 'result') return;
   setProgress(80);
   const dims = uni.dims.slice(0, 3), aff = uni.affine;
@@ -366,12 +496,24 @@ async function onResult(res, uni, task, mode, t0) {
   }
   const secs = ((performance.now() - t0) / 1000).toFixed(1);
   log(`✔ done in ${secs}s (wasm ${res.ms?.toFixed(0)} ms)`);
+  if ($('#verbose')?.checked) {
+    for (const [k, o] of Object.entries(outputs)) {
+      if (k === 'uni' || k === '__preview') continue;
+      const s = volStats(o.data);
+      log(`  [verbose] ${o.label}: ${s.nz} non-zero voxels, median ${s.med.toFixed(k === 'b1' ? 3 : 0)}, range [${s.min.toFixed(0)}, ${s.max.toFixed(0)}]`);
+    }
+  }
   setProgress(100);
+  lastViews = views;
   setupViews(views);
   await buildDownloads(task, mode, uni);
+  // default the axial slider to ~2/3 up the volume (through the cerebrum)
+  const nz = dims[2];
+  $('#slice').max = nz - 1;
+  $('#slice').value = Math.round((nz - 1) * 2 / 3);
   $('#viewerWrap').style.display = 'block';
   showView($('#viewSel').value);
-  $('#run').disabled = false;
+  finishRun();
   setTimeout(() => { $('#progress').style.display = 'none'; setProgress(0); }, 800);
 }
 
@@ -446,6 +588,50 @@ const CMAPS = {
   plasma: ramp([[13, 8, 135], [126, 3, 168], [204, 71, 120], [248, 149, 64], [240, 249, 33]]),
 };
 let curKey = 't1';
+let lastViews = null; // result view list, so input previews can offer a way back
+
+// quick stats over non-zero voxels (verbose logging)
+function volStats(data) {
+  const n = data.length, step = Math.max(1, Math.floor(n / 300000));
+  const nzv = [];
+  let nz = 0, min = Infinity, max = -Infinity;
+  for (let i = 0; i < n; i += step) {
+    const v = data[i];
+    if (v !== 0 && Number.isFinite(v)) { nz++; if (v < min) min = v; if (v > max) max = v; nzv.push(v); }
+  }
+  nzv.sort((a, b) => a - b);
+  const med = nzv.length ? nzv[nzv.length >> 1] : 0;
+  return { nz: nz * step, med, min: min === Infinity ? 0 : min, max: max === -Infinity ? 0 : max };
+}
+
+// robust display window for an arbitrary input volume (units unknown)
+function robustRange(data) {
+  const n = data.length;
+  const step = Math.max(1, Math.floor(n / 200000));
+  const pos = [];
+  for (let i = 0; i < n; i += step) { const v = data[i]; if (v > 0) pos.push(v); }
+  if (!pos.length) return [0, 1];
+  pos.sort((a, b) => a - b);
+  const hi = pos[Math.floor(pos.length * 0.99)] || pos[pos.length - 1];
+  return [0, hi > 0 ? hi : 1];
+}
+
+// Load an input volume into the same slice viewer used for outputs, so inputs
+// can be checked visually before/after running.
+function previewInput(f) {
+  if (!f || !f.data || !f.data.length) { log(`cannot preview ${f?.name || '?'} (no data — re-add the file)`); return; }
+  const dims = (f.dims || []).slice(0, 3);
+  outputs.__preview = { data: f.data, dims, affine: f.affine, label: 'INPUT · ' + f.name, range: robustRange(f.data), cmap: 'gray' };
+  const label = 'INPUT · ' + f.name + (f.role && f.role !== '(ignore)' ? ` (${f.role})` : '');
+  setupViews([['__preview', label], ...(lastViews || [])]);
+  const nz = dims[2] || 1;
+  $('#slice').max = nz - 1;
+  if (+$('#slice').value > nz - 1) $('#slice').value = Math.round((nz - 1) * 2 / 3);
+  $('#viewerWrap').style.display = 'block';
+  $('#viewSel').value = '__preview';
+  showView('__preview');
+  $('#viewerWrap').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
 
 function drawPlane(canvas, o, plane, idx) {
   const [nx, ny, nz] = o.dims;

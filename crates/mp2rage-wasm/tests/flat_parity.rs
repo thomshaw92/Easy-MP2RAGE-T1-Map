@@ -105,6 +105,7 @@ fn wasm_api_b1map_matches_golden() {
         0, // tfl
         80.0,
         &MP,
+        false, // extend_fov off → golden parity
     );
     assert_ifast("B1 t1", &res.t1(), &g3("v_b1map_corr_T1_ms"), 1e-6, 1e-4);
 }

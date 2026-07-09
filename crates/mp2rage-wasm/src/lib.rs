@@ -131,6 +131,7 @@ pub fn t1map_sa2rage(
 
 /// B1-corrected T1 from MP2RAGE UNI + INV2 + a generic B1 map.
 /// `kind`: 0 = tfl (flip x10), 1 = percent, 2 = relative.
+/// `extend_fov`: smoothly extrapolate a too-small B1 FOV to cover the brain.
 #[wasm_bindgen]
 pub fn t1map_b1(
     uni: &[f32],
@@ -143,6 +144,7 @@ pub fn t1map_b1(
     kind: u32,
     ref_angle: f64,
     mp: &[f64],
+    extend_fov: bool,
 ) -> T1Result {
     let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
     let (bx, by, bz) = (b1_dims[0] as usize, b1_dims[1] as usize, b1_dims[2] as usize);
@@ -160,6 +162,7 @@ pub fn t1map_b1(
         kind_s,
         ref_angle,
         &mp_params(mp),
+        extend_fov,
     );
     T1Result {
         t1: flat_ifast(&out.t1_corr),
@@ -177,7 +180,9 @@ pub struct DicomVolume {
     dims: Vec<u32>,   // [nx, ny, nz, nt]
     affine: Vec<f32>, // row-major 4x4 (RAS)
     role: String,
-    params: Vec<f64>, // MP2RAGE [TR,TI1,TI2,FA1,FA2,NZ1,NZ2] or empty
+    params: Vec<f64>,     // MP2RAGE [TR,TI1,TI2,FA1,FA2,NZ1,NZ2] or empty
+    image_type: String,   // DICOM (0008,0008) tokens joined by '\'
+    series_desc: String,  // SeriesDescription / ProtocolName-ish label
 }
 
 #[wasm_bindgen]
@@ -192,6 +197,12 @@ impl DicomVolume {
     pub fn role(&self) -> String { self.role.clone() }
     #[wasm_bindgen(getter)]
     pub fn params(&self) -> Vec<f64> { self.params.clone() }
+    /// DICOM ImageType (0008,0008) tokens joined by '\' (e.g. "ORIGINAL\PRIMARY\M\ND").
+    #[wasm_bindgen(getter)]
+    pub fn image_type(&self) -> String { self.image_type.clone() }
+    /// SeriesDescription (for duplicate/similar-series detection).
+    #[wasm_bindgen(getter)]
+    pub fn series_desc(&self) -> String { self.series_desc.clone() }
 }
 
 /// Parse one DICOM series given all its files concatenated, with `offsets`
@@ -218,12 +229,16 @@ pub fn parse_dicom_series(concat: &[u8], offsets: &[u32]) -> Result<DicomVolume,
             affine.push(s.affine[r][c] as f32);
         }
     }
+    let image_type = s.rep.image_type.join("\\");
+    let series_desc = s.rep.series_desc.clone();
     Ok(DicomVolume {
         data: s.data,
         dims: vec![s.nx as u32, s.ny as u32, s.nz as u32, s.nt as u32],
         affine,
         role: s.role,
         params,
+        image_type,
+        series_desc,
     })
 }
 
