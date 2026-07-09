@@ -74,17 +74,17 @@ const state = { files: [], jsons: [] };
 function guessRole(name) {
   const n = name.toLowerCase();
   if (/sa2rage|sa2/.test(n)) return 'SA2RAGE';
-  // A Siemens TFL B1 map (TB1TFL / tfl_b1map) produces TWO series: an anatomical
-  // reference and the flip-angle map. Only the flip-angle map ("famp") is the B1
-  // map; the anatomical image ("anat") must not be used for correction.
-  if (/tb1tfl|b1map|_b1\b|flip.?angle|tfl/.test(n)) {
-    if (/famp|flip.?angle|fa[_-]?map/.test(n)) return 'B1 map';
-    if (/anat/.test(n)) return '(ignore)';
-    return 'B1 map';
-  }
+  // A flip-angle map ("famp") is unambiguously the B1 map — strongest signal.
+  if (/famp|flip.?angle|fa[_-]?map/.test(n)) return 'B1 map';
+  // Structural MP2RAGE images are matched BEFORE the weaker b1map/tfl hint:
+  // Siemens MP2RAGE is itself a TFL sequence ("tfl3d1"), so "tfl" can appear in
+  // UNI/INV filenames and must not shadow their real role.
   if (/uni/.test(n)) return 'UNI';
   if (/inv-?2|inv2/.test(n)) return 'INV2';
   if (/inv-?1|inv1/.test(n)) return 'INV1';
+  // A Siemens TFL B1-mapping sequence (TB1TFL / tfl_b1map) also exports an
+  // anatomical reference — that one must be ignored, not used for correction.
+  if (/tb1tfl|b1map|_b1\b|tfl.?b1|b1.?map/.test(n)) return /anat/.test(n) ? '(ignore)' : 'B1 map';
   return '(ignore)';
 }
 
@@ -160,7 +160,7 @@ function renderTable() {
   // JSON sidecar rows
   for (const [i, j] of state.jsons.entries()) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>📄 ${j.name}</td><td class="dim">JSON</td><td class="dim">parameters (matched by name)</td>`;
+    tr.innerHTML = `<td>📄 ${esc(j.name)}</td><td class="dim">JSON</td><td class="dim">parameters (matched by name)</td>`;
     const del = document.createElement('td');
     const b = document.createElement('button'); b.className = 'secondary'; b.textContent = '✕'; b.style.padding = '2px 9px';
     b.onclick = () => { state.jsons.splice(i, 1); renderTable(); };
