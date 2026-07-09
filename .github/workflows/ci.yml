@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+jobs:
+  native:
+    name: Rust tests (golden parity + CLI + WASM API)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: cargo test
+        run: cargo test --release
+      - name: WASM build check (wasm32-unknown-unknown)
+        run: cargo build --release -p mp2rage-wasm --target wasm32-unknown-unknown
+
+  web-e2e:
+    name: In-browser data path (WASM in Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - name: Build WASM + stage web/
+        run: bash tools/build_wasm.sh
+        env:
+          WASM_PACK: wasm-pack
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: nifti.js -> WASM -> nifti.js reproduces the golden
+        run: node web/test/e2e_node.mjs
