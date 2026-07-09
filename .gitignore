@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+
+# outputs / data
+derivatives/
+*.nii
+*.nii.gz
+*.IMA
+*.dcm
+qc/
+work/
+*.png
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
