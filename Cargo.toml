@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mp2rage-core", "crates/mp2rage-cli"]
+members = ["crates/mp2rage-core", "crates/mp2rage-cli", "crates/mp2rage-wasm"]
 
 [workspace.package]
 version = "0.1.0"

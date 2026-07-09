@@ -7,6 +7,7 @@ pub mod filt;
 pub mod interp;
 pub mod mask;
 pub mod model;
+pub mod pipeline;
 pub mod resample;
 
 pub use model::{Mp2rageParams, Sa2rageParams};

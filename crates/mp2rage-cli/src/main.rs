@@ -9,8 +9,8 @@ use std::process::exit;
 use ndarray::Array3;
 
 use mp2rage_cli::nifti_io::{read_nifti, write_nifti_f32};
-use mp2rage_cli::pipeline::{run_b1map, run_sa2rage, Outputs};
 use mp2rage_core::model::{Mp2rageParams, Sa2rageParams};
+use mp2rage_core::pipeline::{run_b1map, run_sa2rage, Outputs};
 
 fn usage() -> ! {
     eprintln!(

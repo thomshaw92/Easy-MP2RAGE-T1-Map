@@ -4,13 +4,13 @@
 
 use ndarray::Array3;
 
-use mp2rage_core::correct::{t1b1_correct, t1b1_correct_with_b1map};
-use mp2rage_core::filt::gaussian_filter3;
-use mp2rage_core::interp::np_interp_vec;
-use mp2rage_core::mask::{brain_mask, percentile};
-use mp2rage_core::model::{sa2rage_lookuptable, t1_from_uni, Mp2rageParams, Sa2rageParams};
-use mp2rage_core::resample::resample_to;
-use mp2rage_core::Affine;
+use crate::correct::{t1b1_correct, t1b1_correct_with_b1map};
+use crate::filt::gaussian_filter3;
+use crate::interp::np_interp_vec;
+use crate::mask::{brain_mask, percentile};
+use crate::model::{sa2rage_lookuptable, t1_from_uni, Mp2rageParams, Sa2rageParams};
+use crate::resample::resample_to;
+use crate::Affine;
 
 pub struct Outputs {
     pub t1_corr: Array3<f64>,   // B1-corrected T1 (ms), 0 outside mask / non-converged
