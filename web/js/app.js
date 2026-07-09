@@ -2,6 +2,13 @@
 // Parses NIfTI in JS (nifti.js), runs the WASM core in a Web Worker, previews
 // with NiiVue, and offers client-side downloads. No data ever leaves the tab.
 import { readNifti, writeNiftiF32, writeNiftiGz } from './nifti.js';
+import initWasm, { parse_dicom_series } from '../wasm/mp2rage_wasm.js';
+
+let wasmReady;
+function ensureWasm() {
+  if (!wasmReady) wasmReady = initWasm(new URL('../wasm/mp2rage_wasm_bg.wasm', import.meta.url));
+  return wasmReady;
+}
 
 const $ = (s) => document.querySelector(s);
 const logEl = $('#log');
@@ -136,13 +143,76 @@ function refreshRunState() {
   return { uni, inv2, sa, b1, mode };
 }
 
+// ---- DICOM folders --------------------------------------------------------
+const getFile = (entry) => new Promise((res) => entry.file(res));
+
+// recursively collect File objects under a directory entry (readEntries is batched)
+function collectFiles(dirEntry) {
+  return new Promise((resolve) => {
+    const reader = dirEntry.createReader();
+    const files = [];
+    const pump = () => reader.readEntries(async (batch) => {
+      if (!batch.length) { resolve(files); return; }
+      for (const e of batch) {
+        if (e.isFile) files.push(await getFile(e));
+        else if (e.isDirectory) files.push(...await collectFiles(e));
+      }
+      pump();
+    }, () => resolve(files));
+  });
+}
+
+async function addDicomFolder(name, files) {
+  if (!files.length) return;
+  log(`reading DICOM folder "${name}" (${files.length} files) …`);
+  await ensureWasm();
+  const bufs = await Promise.all(files.map((f) => f.arrayBuffer()));
+  const total = bufs.reduce((a, b) => a + b.byteLength, 0);
+  const concat = new Uint8Array(total), offsets = new Uint32Array(bufs.length + 1);
+  let o = 0;
+  bufs.forEach((b, i) => { offsets[i] = o; concat.set(new Uint8Array(b), o); o += b.byteLength; });
+  offsets[bufs.length] = o;
+  let v;
+  try { v = parse_dicom_series(concat, offsets); }
+  catch (e) { log(`  ${name}: ${e}`); return; }
+  const dims = Array.from(v.dims);
+  state.files.push({ name, dims, affine: v.affine, data: v.data, role: v.role, dicom: true });
+  log(`  ${name} → [${dims.join('×')}] role ${v.role}`);
+  const params = Array.from(v.params);
+  if (params.length === 7) {
+    ['mp_tr', 'mp_ti1', 'mp_ti2', 'mp_fa1', 'mp_fa2', 'mp_nz1', 'mp_nz2'].forEach((id, i) => {
+      const el = $('#' + id); if (el) el.value = +params[i].toFixed(4);
+    });
+    $('#paramSource').textContent = 'from DICOM header';
+    log('  auto-filled MP2RAGE parameters from the DICOM ASCCONV header');
+  }
+  renderTable(); refreshRunState();
+}
+
+async function handleDrop(e) {
+  const dt = e.dataTransfer;
+  const entries = dt.items ? [...dt.items].map((it) => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean) : [];
+  if (!entries.length) { if (dt.files?.length) await addFiles(dt.files); return; }
+  const niftis = [], loose = [], folders = [];
+  for (const en of entries) {
+    if (en.isDirectory) folders.push(en);
+    else if (en.isFile) {
+      const f = await getFile(en);
+      (/\.(nii(\.gz)?|json)$/i.test(f.name) ? niftis : loose).push(f);
+    }
+  }
+  if (niftis.length) await addFiles(niftis);
+  if (loose.length) await addDicomFolder('(dropped files)', loose);
+  for (const dir of folders) await addDicomFolder(dir.name, await collectFiles(dir));
+}
+
 // drag & drop
 const drop = $('#drop');
 drop.onclick = () => $('#file').click();
 $('#file').onchange = (e) => addFiles(e.target.files);
 ['dragover', 'dragenter'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('hover'); }));
 ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('hover'); }));
-drop.addEventListener('drop', (e) => addFiles(e.dataTransfer.files));
+drop.addEventListener('drop', handleDrop);
 
 // ---- run -------------------------------------------------------------------
 let worker;
@@ -283,12 +353,43 @@ function drawSlices(o) {
   drawPlane($('#csa'), o, 'sa', Math.floor(nx / 2));
 }
 
+function drawHistogram(o) {
+  const c = $('#hist'); const ctx = c.getContext('2d');
+  const W = c.width = (c.clientWidth || 800), H = c.height = 120;
+  ctx.clearRect(0, 0, W, H);
+  const isT1 = o.label.startsWith('T1');
+  const rlo = isT1 ? 300 : o.range[0], rhi = isT1 ? 4200 : o.range[1];
+  const nb = 100, bins = new Float64Array(nb);
+  let maxc = 0;
+  for (let i = 0; i < o.data.length; i++) {
+    const v = o.data[i];
+    if (v > rlo && v < rhi) bins[Math.min(nb - 1, ((v - rlo) / (rhi - rlo) * nb) | 0)]++;
+  }
+  for (let b = 0; b < nb; b++) maxc = Math.max(maxc, bins[b]);
+  const pad = 18;
+  ctx.fillStyle = '#93a1b0'; ctx.font = '10px -apple-system,sans-serif';
+  if (maxc === 0) { ctx.fillText('no data in range', 10, H / 2); return; }
+  const bw = (W - pad - 6) / nb;
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#7c5cff'); grad.addColorStop(1, '#5aa2ff');
+  ctx.fillStyle = grad;
+  for (let b = 0; b < nb; b++) {
+    const h = (bins[b] / maxc) * (H - pad - 8);
+    ctx.fillRect(pad + b * bw, H - pad - h, Math.max(1, bw - 0.5), h);
+  }
+  ctx.fillStyle = '#93a1b0';
+  ctx.fillText(`${o.label} — histogram (brain)`, pad, 12);
+  ctx.fillText(String(Math.round(rlo)), pad, H - 4);
+  ctx.textAlign = 'right'; ctx.fillText(String(Math.round(rhi)), W - 4, H - 4); ctx.textAlign = 'left';
+}
+
 function showView(key) {
   curKey = ({ t1: 't1', t1u: 't1u', b1: 'b1', uni: 'uni' })[key] || 't1';
   const o = outputs[curKey];
   if (!o) return;
   $('#viewStat').textContent = `${o.label} · ${o.dims.join('×')} · window [${o.range[0]}, ${o.range[1]}]`;
   drawSlices(o);
+  drawHistogram(o);
 }
 $('#viewSel').onchange = () => showView($('#viewSel').value);
 $('#cmapSel').onchange = () => showView(curKey === 't1u' ? 't1u' : curKey === 'b1' ? 'b1' : curKey === 'uni' ? 'uni' : 't1');

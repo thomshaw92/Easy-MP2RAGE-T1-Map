@@ -11,6 +11,7 @@
 use ndarray::Array3;
 use wasm_bindgen::prelude::*;
 
+use mp2rage_core::dicom;
 use mp2rage_core::model::{Mp2rageParams, Sa2rageParams};
 use mp2rage_core::pipeline::{run_b1map, run_sa2rage};
 use mp2rage_core::Affine;
@@ -166,6 +167,63 @@ pub fn t1map_b1(
         t1_uncorr: flat_ifast(&out.t1_uncorr),
         dims: vec![nx as u32, ny as u32, nz as u32],
     }
+}
+
+/// A DICOM series parsed into a volume + geometry + detected role + params.
+#[wasm_bindgen]
+pub struct DicomVolume {
+    data: Vec<f32>,   // i-fastest, length nx*ny*nz*nt
+    dims: Vec<u32>,   // [nx, ny, nz, nt]
+    affine: Vec<f32>, // row-major 4x4 (RAS)
+    role: String,
+    params: Vec<f64>, // MP2RAGE [TR,TI1,TI2,FA1,FA2,NZ1,NZ2] or empty
+}
+
+#[wasm_bindgen]
+impl DicomVolume {
+    #[wasm_bindgen(getter)]
+    pub fn data(&self) -> Vec<f32> { self.data.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn dims(&self) -> Vec<u32> { self.dims.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn affine(&self) -> Vec<f32> { self.affine.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn role(&self) -> String { self.role.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn params(&self) -> Vec<f64> { self.params.clone() }
+}
+
+/// Parse one DICOM series given all its files concatenated, with `offsets`
+/// delimiting each file (length = nfiles + 1, byte offsets into `concat`).
+#[wasm_bindgen]
+pub fn parse_dicom_series(concat: &[u8], offsets: &[u32]) -> Result<DicomVolume, JsValue> {
+    let mut files = Vec::new();
+    for w in offsets.windows(2) {
+        let (s, e) = (w[0] as usize, w[1] as usize);
+        if e <= concat.len() && s < e {
+            if let Ok(df) = dicom::parse(&concat[s..e]) {
+                files.push(df);
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(JsValue::from_str("no readable (uncompressed) DICOM files in this folder"));
+    }
+    let params = dicom::mp2rage_params(&files[0]).unwrap_or_default();
+    let s = dicom::assemble(files).map_err(|e| JsValue::from_str(&e))?;
+    let mut affine = Vec::with_capacity(16);
+    for r in 0..4 {
+        for c in 0..4 {
+            affine.push(s.affine[r][c] as f32);
+        }
+    }
+    Ok(DicomVolume {
+        data: s.data,
+        dims: vec![s.nx as u32, s.ny as u32, s.nz as u32, s.nt as u32],
+        affine,
+        role: s.role,
+        params,
+    })
 }
 
 /// Library version string (for the UI footer / provenance).

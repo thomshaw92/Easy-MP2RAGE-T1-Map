@@ -8,7 +8,8 @@ use std::process::exit;
 
 use ndarray::Array3;
 
-use mp2rage_cli::nifti_io::{read_nifti, write_nifti_f32};
+use mp2rage_cli::load::load;
+use mp2rage_cli::nifti_io::write_nifti_f32;
 use mp2rage_core::model::{Mp2rageParams, Sa2rageParams};
 use mp2rage_core::pipeline::{run_b1map, run_sa2rage, Outputs};
 
@@ -78,14 +79,17 @@ fn main() {
         inv_eff: f(&m, "inv-eff", 0, 0.96),
     };
 
-    let read = |p: &str| read_nifti(p).unwrap_or_else(|e| {
+    let load_ = |p: &str| load(p).unwrap_or_else(|e| {
         eprintln!("{e}");
         exit(1);
     });
-    let uni_v = read(uni_p);
-    let inv2_v = read(inv2_p);
-    let uni = uni_v.to_array3();
-    let inv2 = inv2_v.to_array3();
+    let uni_v = load_(uni_p);
+    let inv2_v = load_(inv2_p);
+    if let Some(r) = &uni_v.role {
+        println!("  UNI input: {} (DICOM role detected: {r})", uni_p);
+    }
+    let uni = &uni_v.c0;
+    let inv2 = &inv2_v.c0;
 
     let out_data: Outputs = if let Some(sa_p) = path(&m, "sa2rage") {
         let sa = Sa2rageParams {
@@ -96,19 +100,19 @@ fn main() {
             flash_tr: f(&m, "sa-trflash", 0, 5.0e-3),
             average_t1: f(&m, "sa-avgt1", 0, 1.5),
         };
-        let sa_v = read(sa_p);
-        if sa_v.dims.len() < 4 || sa_v.dims[3] < 2 {
-            eprintln!("SA2RAGE must be a 2-volume (S1,S2) image");
-            exit(1);
-        }
+        let sa_v = load_(sa_p);
+        let s_b = match &sa_v.c1 {
+            Some(v) => v,
+            None => { eprintln!("SA2RAGE must be a 2-volume (S1,S2) image"); exit(1); }
+        };
         println!("[SA2RAGE B1 source]");
-        run_sa2rage(&uni, &inv2, &sa_v.component(0), &sa_v.component(1), &uni_v.affine, &sa_v.affine, &mp, &sa)
+        run_sa2rage(uni, inv2, &sa_v.c0, s_b, &uni_v.affine, &sa_v.affine, &mp, &sa)
     } else if let Some(b1_p) = path(&m, "b1-map") {
         let kind = m.get("b1-map-type").and_then(|v| v.first()).map(|s| s.as_str()).unwrap_or("tfl");
         let ref_angle = f(&m, "b1-ref-angle", 0, 80.0);
-        let b1_v = read(b1_p);
+        let b1_v = load_(b1_p);
         println!("[B1-map source: type={kind}]");
-        run_b1map(&uni, &inv2, &b1_v.to_array3(), &uni_v.affine, &b1_v.affine, kind, ref_angle, &mp)
+        run_b1map(uni, inv2, &b1_v.c0, &uni_v.affine, &b1_v.affine, kind, ref_angle, &mp)
     } else {
         eprintln!("need --sa2rage or --b1-map");
         usage();
