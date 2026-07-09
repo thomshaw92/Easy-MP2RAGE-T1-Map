@@ -143,6 +143,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mp2rage-cli"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "mp2rage-core",
+ "ndarray",
+ "ndarray-npy",
+]
+
+[[package]]
 name = "mp2rage-core"
 version = "0.1.0"
 dependencies = [

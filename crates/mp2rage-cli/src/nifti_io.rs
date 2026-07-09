@@ -218,9 +218,10 @@ pub fn write_nifti_f32(path: &str, vol: &Array3<f32>, affine: &Affine) -> Result
     }
     h[344..348].copy_from_slice(b"n+1\0");
 
-    let mut body = Vec::with_capacity(4 + nx * ny * nz * 4);
+    // h is 352 bytes: the 348-byte header + the 4 extension bytes (all zero),
+    // so data begins exactly at vox_offset = 352.
+    let mut body = Vec::with_capacity(352 + nx * ny * nz * 4);
     body.extend_from_slice(&h);
-    body.extend_from_slice(&[0u8; 4]); // pad 348 -> 352
     // data on disk: i fastest
     for k in 0..nz {
         for j in 0..ny {
