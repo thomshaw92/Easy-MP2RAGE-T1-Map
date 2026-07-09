@@ -379,10 +379,12 @@ async function buildDownloads(task, mode, uni) {
     : task === 'b1only'
       ? [['b1', b1name]]
       : [['t1', 'T1map.nii.gz'], ['b1', b1name], ['t1u', 'T1map_uncorrected.nii.gz'], ['unic', 'UNI_b1corrected.nii.gz']];
+  const bundle = []; // {name, data:Uint8Array} for the "download all" zip
   for (const [key, fname] of items) {
     const o = outputs[key]; if (!o) continue;
     const gz = await writeNiftiGz(o.data, o.dims, o.affine);
     addLink(dd, new Blob([gz], { type: 'application/gzip' }), fname);
+    bundle.push({ name: fname, data: gz });
   }
   // derived DICOM T1 series — only for the T1 task when the UNI input was a DICOM folder
   if (task === 't1' && uni && uni.src && outputs.t1) {
@@ -395,20 +397,32 @@ async function buildDownloads(task, mode, uni) {
       for (let i = 0; i < offs.length - 1; i++)
         files.push({ name: `T1map_${String(i + 1).padStart(4, '0')}.dcm`, data: data.subarray(offs[i], offs[i + 1]) });
       addLink(dd, new Blob([zipStore(files)], { type: 'application/zip' }), 'T1map_DICOM.zip');
+      for (const f of files) bundle.push({ name: `T1map_DICOM/${f.name}`, data: f.data });
       log(`  DICOM: derived ${files.length}-slice T1 series ready (.zip)`);
     } catch (e) { log('DICOM export skipped: ' + e); }
   }
   const prov = {
-    software: 'easy-mp2rage-t1map (wasm)', mode,
+    software: 'easy-mp2rage-t1map (wasm)', task, mode,
     mp2rage: mpParams(), sa2rage: mode === 'sa2rage' ? saParams() : undefined,
     b1_map_type: mode === 'b1map' ? $('#b1_type').value : undefined,
     note: 'Computed entirely in-browser; no data uploaded.',
   };
-  addLink(dd, new Blob([JSON.stringify(prov, null, 2)], { type: 'application/json' }), 'parameters.json');
+  const provBytes = new TextEncoder().encode(JSON.stringify(prov, null, 2));
+  addLink(dd, new Blob([provBytes], { type: 'application/json' }), 'parameters.json');
+  bundle.push({ name: 'parameters.json', data: provBytes });
+  // "download all" — one zip of every derivative, shown first and highlighted
+  if (bundle.length > 1) {
+    const a = addLink(dd, new Blob([zipStore(bundle)], { type: 'application/zip' }), 'all_derivatives.zip');
+    a.textContent = '⬇ Download all (.zip)';
+    a.style.fontWeight = '700';
+    a.style.borderColor = 'var(--accent)';
+    dd.insertBefore(a, dd.firstChild);
+  }
 }
 function addLink(parent, blob, fname) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fname; a.textContent = '⬇ ' + fname;
   parent.appendChild(a);
+  return a;
 }
 
 // ---- built-in canvas slice viewer (self-contained, no external deps) -------

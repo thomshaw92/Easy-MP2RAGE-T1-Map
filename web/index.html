@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Easy MP2RAGE T1 Map</title>
+<title>Easy MP2RAGE T1 Map — T1 mapping, B1 correction &amp; UNI denoising</title>
 <style>
   :root{
     --bg:#0d1014; --bg2:#0f1319; --panel:#161b22; --panel2:#1d242d; --line:#28313c;
@@ -98,7 +98,7 @@
     <div class="mark"><span>T1</span></div>
     <div>
       <h1>Easy <span class="g">MP2RAGE T1 Map</span></h1>
-      <div class="tag">B1-corrected quantitative T1 mapping · MP2RAGE + SA2RAGE / B1 map · 3T &amp; 7T</div>
+      <div class="tag">Turn your MP2RAGE scans into quantitative <b>T1 maps</b> — corrected for B1 (from SA2RAGE or a B1 map) — and clean up the UNI background with <b>denoising</b>. 3T &amp; 7T.</div>
     </div>
     <span class="badge" title="Nothing is uploaded. Processing happens locally in this browser tab.">🔒 100% in your browser — no data leaves your computer</span>
   </div>
@@ -109,19 +109,24 @@
   <div class="about-body">
     <p><b>What it does.</b> Computes a quantitative <b>T1 map</b> (in ms) from a Siemens <b>MP2RAGE</b>
     acquisition, corrected for transmit-field (<b>B1⁺</b>) inhomogeneity using either a <b>SA2RAGE</b>
-    scan or a separately acquired <b>B1 map</b> (e.g. a Siemens tfl B1 map). It is a Rust→WebAssembly port
-    of the T1-mapping parts of <a href="https://github.com/JosePMarques/MP2RAGE-related-scripts">J. P. Marques'
-    scripts</a>, validated to match the reference pipeline to machine precision.</p>
-    <p><b>Outputs.</b> B1-corrected T1 map (ms), the uncorrected T1 map, a <b>relative B1 map</b>
-    (computed from your SA2RAGE — a standalone output you can keep), the B1-corrected UNI, and a
+    scan or a separately acquired <b>B1 map</b> (e.g. a Siemens tfl B1 map). It can also compute a
+    standalone <b>relative B1 map</b> from SA2RAGE, and <b>denoise</b> the MP2RAGE UNI into a clean
+    UNI-DEN (O'Brien et al. robust combination — removes the salt-and-pepper background noise).
+    It is a Rust→WebAssembly port of the T1-mapping parts of
+    <a href="https://github.com/JosePMarques/MP2RAGE-related-scripts">J. P. Marques' scripts</a>,
+    validated to match the reference pipeline to machine precision.</p>
+    <p><b>Outputs.</b> Depending on the task: a B1-corrected <b>T1 map</b> (ms) and the uncorrected T1,
+    a relative <b>B1 map</b>, a denoised <b>UNI-DEN</b>, the B1-corrected UNI, and a
     <code>parameters.json</code>. The result panel overlays a pre/post (uncorrected vs corrected) T1
-    histogram, and everything downloads as NIfTI.</p>
+    histogram; download each as NIfTI (plus a derived DICOM T1 series), or grab them all at once as a
+    single <code>.zip</code>.</p>
     <p><b>Privacy.</b> Everything runs inside this browser tab via WebAssembly. Your images are never
     uploaded to any server — there is no server. You can disconnect from the network and it still works.</p>
-    <p><b>How to use.</b> (1) Drop your NIfTI files and tag their roles. (2) Confirm the sequence parameters
-    (7T/3T presets provided; dcm2niix <code>.json</code> sidecars auto-fill them). (3) Compute, preview, and
-    download the T1/B1 maps as NIfTI. Inputs needed: the <b>UNI</b> image, <b>INV2</b> (for the brain mask),
-    and a B1 source — a 2-volume <b>SA2RAGE</b> or a <b>B1 map</b>.</p>
+    <p><b>How to use.</b> (1) Drop your NIfTI files or DICOM folders and tag their roles. (2) Confirm the
+    sequence parameters — from JSON sidecars, DICOM headers, or a 7T/3T preset. (3) Pick a task
+    (<b>T1 map</b>, <b>SA2RAGE → B1 map</b>, or <b>UNI denoising</b>) and Compute, then preview and
+    download. A T1 map needs the <b>UNI</b>, <b>INV2</b> (brain mask) and a B1 source (2-volume
+    <b>SA2RAGE</b> or a <b>B1 map</b>); denoising needs UNI + <b>INV1</b> + INV2.</p>
     <p class="note">Research software, provided as-is with no warranty. Sanity-check the maps and confirm the
     parameters against your protocol. Cite Marques 2010 (NeuroImage), Marques &amp; Gruetter 2013 (PLoS ONE),
     Eggenschwiler 2012 (MRM).</p>
