@@ -7,7 +7,8 @@ Web app: https://thomshaw92.github.io/Easy-MP2RAGE-T1-Map/
 
 Drag in DICOM folders or NIfTI files, set their roles, and it computes a
 B1-corrected T1 map in your browser. Nothing is uploaded and there is no server.
-Outputs download as NIfTI, plus a derived DICOM series for the T1 map.
+Outputs download as NIfTI. When the input was a DICOM folder, the T1 map also
+downloads as a derived DICOM series.
 
 ## What it does
 

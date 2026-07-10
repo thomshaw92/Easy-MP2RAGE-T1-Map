@@ -42,3 +42,13 @@ references:
     start: 1609
     end: 1619
     doi: 10.1002/mrm.23145
+  - type: article
+    authors:
+      - family-names: O'Brien
+        given-names: Kieran R.
+    title: "Robust T1-weighted structural brain imaging and morphometry at 7T using MP2RAGE"
+    journal: PLoS ONE
+    volume: 9
+    year: 2014
+    start: e99676
+    doi: 10.1371/journal.pone.0099676

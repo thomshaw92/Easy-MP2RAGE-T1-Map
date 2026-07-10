@@ -141,18 +141,24 @@ function renderTable() {
     const nameTd = document.createElement('td');
     nameTd.className = 'clickname';
     nameTd.title = 'click to preview this image in the viewer';
+    nameTd.setAttribute('role', 'button');
+    nameTd.setAttribute('tabindex', '0');
+    nameTd.setAttribute('aria-label', 'Preview ' + f.name);
     nameTd.innerHTML = `👁 <span>${esc(f.name)}</span>`;
     nameTd.onclick = () => previewInput(f);
+    nameTd.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); previewInput(f); } };
     tr.appendChild(nameTd);
     const dimTd = document.createElement('td'); dimTd.className = 'dim'; dimTd.textContent = f.dims.join(' × ');
     tr.appendChild(dimTd);
     const roleTd = document.createElement('td');
     const sel = document.createElement('select');
+    sel.setAttribute('aria-label', 'Role for ' + f.name);
     for (const r of ROLES) { const o = document.createElement('option'); o.value = o.textContent = r; if (r === f.role) o.selected = true; sel.appendChild(o); }
     sel.onchange = () => { f.role = sel.value; refreshRunState(); };
     roleTd.appendChild(sel); tr.appendChild(roleTd);
     const del = document.createElement('td');
     const b = document.createElement('button'); b.className = 'secondary'; b.textContent = '✕'; b.style.padding = '2px 9px';
+    b.setAttribute('aria-label', 'Remove ' + f.name);
     b.onclick = () => { state.files.splice(i, 1); renderTable(); refreshRunState(); };
     del.appendChild(b); tr.appendChild(del);
     tb.appendChild(tr);
@@ -244,6 +250,7 @@ function refreshRunState() {
     status = ok
       ? `Ready: ${mode === 'sa2rage' ? 'SA2RAGE' : 'B1-map'} correction${inv2 ? '' : ' (no INV2 → mask from UNI)'}.`
       : 'Need a UNI and a B1 source (SA2RAGE or B1 map).';
+    if (ok && sa && b1) status += ' Both a SA2RAGE and a B1 map are loaded — using SA2RAGE; set the B1 map’s role to (ignore) to use it instead.';
   }
   $('#run').disabled = !ok;
   $('#run').textContent = label;
@@ -325,6 +332,10 @@ async function handleDrop(e) {
 // drag & drop
 const drop = $('#drop');
 drop.onclick = () => $('#file').click();
+// keyboard access: the drop zone acts as a button to open the file picker
+drop.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('#file').click(); }
+});
 $('#file').onchange = (e) => addFiles(e.target.files);
 ['dragover', 'dragenter'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('hover'); }));
 ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('hover'); }));
@@ -365,6 +376,8 @@ function freshWorker() {
 
 const outputs = {}; // key -> {data, dims, affine, label, range, cmap}
 function clearOutputs() { for (const k of Object.keys(outputs)) delete outputs[k]; }
+let objectUrls = []; // download blob: URLs, revoked before each rebuild to avoid leaks
+function revokeDownloadUrls() { objectUrls.forEach((u) => URL.revokeObjectURL(u)); objectUrls = []; }
 
 // Reset the run UI (after a result, an error, or Stop).
 function finishRun() {
@@ -391,22 +404,58 @@ function resetAll() {
   clearOutputs(); lastViews = null; curKey = 't1';
   renderTable();
   $('#viewerWrap').style.display = 'none';
-  $('#downloads').innerHTML = '';
+  revokeDownloadUrls(); $('#downloads').innerHTML = '';
   const wb = $('#warnings'); if (wb) { wb.innerHTML = ''; wb.style.display = 'none'; }
   logEl.textContent = '';
   applyPreset('7T');
   buildForm($('#b1Grid'), B1_SPEC, 'b1');
   $('#paramSource').value = 'manual'; $('#paramSrcNote').textContent = 'manual';
   $('#taskSel').value = 't1';
-  if ($('#extendFov')) $('#extendFov').checked = true;
+  if ($('#extendFov')) $('#extendFov').checked = false;
+  if ($('#deid')) $('#deid').checked = true;
+  if ($('#verbose')) $('#verbose').checked = false;
   refreshRunState();
   log('↺ reset — all inputs, parameters and results cleared.');
 }
 $('#resetAll').onclick = resetAll;
 
+// tutorial modal
+const tutModal = $('#tutorialModal');
+const openTutorial = () => { tutModal.style.display = 'flex'; };
+const closeTutorial = () => { tutModal.style.display = 'none'; };
+$('#tutorialBtn').onclick = openTutorial;
+$('#tutClose').onclick = closeTutorial;
+tutModal.addEventListener('click', (e) => { if (e.target === tutModal) closeTutorial(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && tutModal.style.display === 'flex') closeTutorial(); });
+
+// Validate inputs/params before dispatching to the worker, so empty/NaN fields,
+// mismatched grids or a non-2-volume SA2RAGE fail with a clear message instead of
+// a silent all-NaN result or a raw WASM panic.
+function validateBeforeRun(sel) {
+  const { uni, inv1, inv2, sa, mode, task } = sel;
+  const d3 = (f) => f.dims.slice(0, 3).join('×');
+  const sameGrid = (a, b) => a.dims[0] === b.dims[0] && a.dims[1] === b.dims[1] && a.dims[2] === b.dims[2];
+  for (const [nm, f] of [['INV2', inv2], ['INV1', task === 'denoise' ? inv1 : null]]) {
+    if (f && !sameGrid(uni, f)) return `${nm} (${d3(f)}) and UNI (${d3(uni)}) have different dimensions. They must be on the same grid.`;
+  }
+  if (mode === 'sa2rage' && sa && (sa.dims[3] || 1) < 2)
+    return `SA2RAGE must be a 2-volume (S1,S2) image — this one is ${sa.dims.slice(0, 4).join('×')}. Load the original 2-volume SA2RAGE.`;
+  const bad = [];
+  const chk = (names, vals) => names.forEach((n, i) => { if (!Number.isFinite(vals[i])) bad.push(n); });
+  chk(['TR', 'TI1', 'TI2', 'FA1', 'FA2', 'NZ1', 'NZ2', 'TRFLASH', 'invEff'], mpParams());
+  if (mode === 'sa2rage') chk(['SA-TR', 'SA-TD1', 'SA-TD2', 'SA-FA1', 'SA-FA2', 'SA-NZ1', 'SA-NZ2', 'SA-TRFLASH', 'avgT1'], saParams());
+  if (mode === 'b1map' && !Number.isFinite(num('#b1_refangle'))) bad.push('ref flip');
+  if (task === 'denoise' && !Number.isFinite(num('#reg'))) bad.push('denoise strength');
+  if (bad.length) return `These parameter fields are empty or not a number: ${bad.join(', ')}. Fill them in (or use a preset).`;
+  return null;
+}
+
 $('#run').onclick = async () => {
-  const { uni, inv1, inv2, sa, b1, mode, task } = refreshRunState();
+  const sel = refreshRunState();
+  const { uni, inv1, inv2, sa, b1, mode, task } = sel;
   if ($('#run').disabled || !uni || running) return;
+  const err = validateBeforeRun(sel);
+  if (err) { log('✖ ' + err); return; }
   running = true;
   $('#run').disabled = true;
   $('#stop').style.display = '';
@@ -475,7 +524,12 @@ function setupViews(list) {
 async function onResult(res, uni, task, mode, t0) {
   if (!running) return; // stale message from a stopped/replaced worker
   if (res.type === 'log') { if ($('#verbose')?.checked) log('  · ' + res.message); return; }
-  if (res.type === 'error') { log('✖ ' + res.message); $('#progress').style.display = 'none'; setProgress(0); finishRun(); return; }
+  if (res.type === 'error') {
+    const full = String(res.message || 'unknown error');
+    log('✖ processing failed: ' + full.split('\n')[0]);
+    if (full.includes('\n')) { if ($('#verbose')?.checked) log(full); else log('  (turn on Verbose log for the full error)'); }
+    $('#progress').style.display = 'none'; setProgress(0); finishRun(); return;
+  }
   if (res.type === 'progress') { setProgress(res.pct); if (res.stage && $('#verbose')?.checked) log('  · ' + res.stage); return; }
   if (res.type !== 'result') return;
   setProgress(80);
@@ -507,10 +561,7 @@ async function onResult(res, uni, task, mode, t0) {
   lastViews = views;
   setupViews(views);
   await buildDownloads(task, mode, uni);
-  // default the axial slider to ~2/3 up the volume (through the cerebrum)
-  const nz = dims[2];
-  $('#slice').max = nz - 1;
-  $('#slice').value = Math.round((nz - 1) * 2 / 3);
+  resetPlanes(dims); // axial ~2/3 up, coronal/sagittal mid
   $('#viewerWrap').style.display = 'block';
   showView($('#viewSel').value);
   finishRun();
@@ -519,7 +570,7 @@ async function onResult(res, uni, task, mode, t0) {
 
 // ---- downloads -------------------------------------------------------------
 async function buildDownloads(task, mode, uni) {
-  const dd = $('#downloads'); dd.innerHTML = '';
+  const dd = $('#downloads'); revokeDownloadUrls(); dd.innerHTML = '';
   const b1name = mode === 'sa2rage' ? 'B1map_from_SA2RAGE.nii.gz' : 'B1map.nii.gz';
   const items = task === 'denoise'
     ? [['unic', 'UNI_denoised.nii.gz']]
@@ -539,7 +590,9 @@ async function buildDownloads(task, mode, uni) {
       await ensureWasm();
       const dims = Uint32Array.from(uni.dims.slice(0, 3));
       const salt = String(Date.now()).slice(-9);
-      const dout = write_dicom_t1(uni.src.concat, uni.src.offsets, outputs.t1.data, dims, salt);
+      const deid = $('#deid') ? $('#deid').checked : true;
+      const dout = write_dicom_t1(uni.src.concat, uni.src.offsets, outputs.t1.data, dims, salt, deid);
+      log(deid ? '  DICOM: output will be de-identified (patient tags removed)' : '  DICOM: output keeps source patient tags (de-identify unchecked)');
       const data = dout.data, offs = dout.offsets, files = [];
       for (let i = 0; i < offs.length - 1; i++)
         files.push({ name: `T1map_${String(i + 1).padStart(4, '0')}.dcm`, data: data.subarray(offs[i], offs[i + 1]) });
@@ -567,7 +620,8 @@ async function buildDownloads(task, mode, uni) {
   }
 }
 function addLink(parent, blob, fname) {
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fname; a.textContent = '⬇ ' + fname;
+  const url = URL.createObjectURL(blob); objectUrls.push(url);
+  const a = document.createElement('a'); a.href = url; a.download = fname; a.textContent = '⬇ ' + fname;
   parent.appendChild(a);
   return a;
 }
@@ -589,6 +643,15 @@ const CMAPS = {
 };
 let curKey = 't1';
 let lastViews = null; // result view list, so input previews can offer a way back
+const planeIdx = { ax: 0, co: 0, sa: 0 }; // current slice index per orthogonal plane
+
+// default slice positions for a freshly shown volume: axial ~2/3 up, others mid
+function resetPlanes(dims) {
+  const [nx, ny, nz] = dims;
+  planeIdx.ax = Math.round((nz - 1) * 2 / 3);
+  planeIdx.co = ny >> 1;
+  planeIdx.sa = nx >> 1;
+}
 
 // quick stats over non-zero voxels (verbose logging)
 function volStats(data) {
@@ -624,9 +687,7 @@ function previewInput(f) {
   outputs.__preview = { data: f.data, dims, affine: f.affine, label: 'INPUT · ' + f.name, range: robustRange(f.data), cmap: 'gray' };
   const label = 'INPUT · ' + f.name + (f.role && f.role !== '(ignore)' ? ` (${f.role})` : '');
   setupViews([['__preview', label], ...(lastViews || [])]);
-  const nz = dims[2] || 1;
-  $('#slice').max = nz - 1;
-  if (+$('#slice').value > nz - 1) $('#slice').value = Math.round((nz - 1) * 2 / 3);
+  resetPlanes(dims);
   $('#viewerWrap').style.display = 'block';
   $('#viewSel').value = '__preview';
   showView('__preview');
@@ -658,12 +719,14 @@ function drawPlane(canvas, o, plane, idx) {
 
 function drawSlices(o) {
   const [nx, ny, nz] = o.dims;
-  const s = $('#slice');
-  s.max = nz - 1;
-  if (+s.value > nz - 1) s.value = Math.floor(nz / 2);
-  drawPlane($('#cax'), o, 'ax', +s.value);
-  drawPlane($('#cco'), o, 'co', Math.floor(ny / 2));
-  drawPlane($('#csa'), o, 'sa', Math.floor(nx / 2));
+  const maxOf = { ax: nz - 1, co: ny - 1, sa: nx - 1 };
+  for (const [p, id] of [['ax', '#slice_ax'], ['co', '#slice_co'], ['sa', '#slice_sa']]) {
+    planeIdx[p] = Math.max(0, Math.min(maxOf[p], planeIdx[p]));
+    const sl = $(id); if (sl) { sl.max = maxOf[p]; sl.value = planeIdx[p]; }
+  }
+  drawPlane($('#cax'), o, 'ax', planeIdx.ax);
+  drawPlane($('#cco'), o, 'co', planeIdx.co);
+  drawPlane($('#csa'), o, 'sa', planeIdx.sa);
 }
 
 function histSmooth(data, rlo, rhi, nb) {
@@ -725,33 +788,70 @@ function drawHistogram(o) {
   ctx.textAlign = 'left';
 
   if (!isT1) return;
-  // WM/GM peaks from the corrected (post) distribution
+  // WM/GM peaks detected dynamically (field-agnostic: works at 3T and 7T) as the
+  // two most prominent modes of the corrected (post) T1 distribution. Lower T1 is
+  // white matter, higher is grey matter — true at every field strength.
   const post = S[S.length - 1].sm;
-  const peakIn = (lo, hi) => {
-    let bi = -1, bc = -1;
-    for (let b = 0; b < nb; b++) { const t = binT1(b); if (t >= lo && t <= hi && post[b] > bc) { bc = post[b]; bi = b; } }
-    return bi < 0 ? null : binT1(bi);
-  };
-  for (const [t, lab, col] of [[peakIn(900, 1700), 'WM', '#7cd6ff'], [peakIn(1700, 2600), 'GM', '#ffd479']]) {
-    if (!t) continue;
+  const modes = topTwoModes(post, nb, binT1);
+  const labels = modes.length === 2 ? ['WM', 'GM'] : ['peak'];
+  const cols = ['#7cd6ff', '#ffd479'];
+  modes.forEach((m, i) => {
+    const t = binT1(m);
     const x = xOf(t);
-    ctx.strokeStyle = col; ctx.setLineDash([3, 3]);
+    ctx.strokeStyle = cols[i]; ctx.setLineDash([3, 3]);
     ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, H - pad); ctx.stroke(); ctx.setLineDash([]);
-    ctx.fillStyle = col; ctx.fillText(`${lab} ~${Math.round(t)}`, Math.min(x + 4, W - 74), top + 6);
+    ctx.fillStyle = cols[i]; ctx.fillText(`${labels[i]} ~${Math.round(t)}`, Math.min(x + 4, W - 74), top + 6);
+  });
+}
+
+// The (up to) two most prominent local maxima of a smoothed histogram, returned
+// as bin indices sorted low→high T1, requiring a minimum peak height and
+// separation so noise ripples aren't picked.
+function topTwoModes(sm, nb, binT1) {
+  let maxc = 0; for (const v of sm) if (v > maxc) maxc = v;
+  if (maxc === 0) return [];
+  const minH = 0.12 * maxc;         // ignore tiny ripples
+  const minSepMs = 250;             // WM and GM must be at least this far apart
+  const cands = [];
+  for (let b = 2; b < nb - 2; b++) {
+    if (sm[b] >= minH && sm[b] > sm[b - 1] && sm[b] >= sm[b + 1] && sm[b] > sm[b - 2] && sm[b] >= sm[b + 2])
+      cands.push(b);
   }
+  cands.sort((a, b) => sm[b] - sm[a]); // strongest first
+  const picks = [];
+  for (const b of cands) {
+    if (picks.every((p) => Math.abs(binT1(p) - binT1(b)) > minSepMs)) picks.push(b);
+    if (picks.length === 2) break;
+  }
+  return picks.sort((a, b) => a - b); // low T1 (WM) first
 }
 
 function showView(key) {
   const o = outputs[key];
   if (!o) return;
   curKey = key;
+  if (o.cmap && CMAPS[o.cmap]) $('#cmapSel').value = o.cmap; // per-view default colormap
   $('#viewStat').textContent = `${o.label} · ${o.dims.join('×')} · window [${o.range[0]}, ${o.range[1]}]`;
   drawSlices(o);
   drawHistogram(o);
 }
 $('#viewSel').onchange = () => showView($('#viewSel').value);
-$('#cmapSel').onchange = () => showView(curKey);
-$('#slice').oninput = () => { const o = outputs[curKey]; if (o) drawSlices(o); };
+$('#cmapSel').onchange = () => { const o = outputs[curKey]; if (o) drawSlices(o); };
+// per-plane sliders
+for (const [p, id] of [['ax', '#slice_ax'], ['co', '#slice_co'], ['sa', '#slice_sa']]) {
+  const sl = $(id); if (!sl) continue;
+  sl.oninput = () => { planeIdx[p] = +sl.value; const o = outputs[curKey]; if (o) drawSlices(o); };
+}
+// mouse-wheel over any panel scrolls that plane
+for (const [cid, p] of [['#cax', 'ax'], ['#cco', 'co'], ['#csa', 'sa']]) {
+  const cv = $(cid); if (!cv) continue;
+  cv.addEventListener('wheel', (e) => {
+    const o = outputs[curKey]; if (!o) return;
+    e.preventDefault();
+    planeIdx[p] += e.deltaY > 0 ? 1 : -1;
+    drawSlices(o);
+  }, { passive: false });
+}
 
 refreshRunState();
 log('Ready. Drop files or DICOM folders, pick a task, and Compute. Everything runs locally.');

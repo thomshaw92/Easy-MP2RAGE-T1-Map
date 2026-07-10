@@ -78,7 +78,7 @@ fn dicom_selftest(dir: &str, outdir: &str) {
     println!("assembled [{},{},{},{}]", s.nx, s.ny, s.nz, s.nt);
     let sources: Vec<&[u8]> = dcm.iter().map(|b| b.as_slice()).collect();
     let t1: Vec<f32> = s.data[..s.nx * s.ny * s.nz].to_vec();
-    let out = dicom::write_derived_series(&sources, &t1, s.nx, s.ny, s.nz, "97531").unwrap();
+    let out = dicom::write_derived_series(&sources, &t1, s.nx, s.ny, s.nz, "97531", false).unwrap();
     std::fs::create_dir_all(outdir).unwrap();
     for (i, f) in out.iter().enumerate() {
         std::fs::write(format!("{outdir}/t1_{i:04}.dcm"), f).unwrap();

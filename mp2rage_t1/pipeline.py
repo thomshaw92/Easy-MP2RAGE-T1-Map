@@ -11,6 +11,7 @@ from scipy.ndimage import (map_coordinates, gaussian_filter,
 
 from . import dicom_io as dio
 from . import model as mp
+from . import denoise as dn
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,7 @@ def run(inputs, output, *, trflash_ms=7.0, inv_eff=0.96,
         mp2rage_slices=None, mp2rage_tis=None, mp2rage_fa=None,
         b1_map=None, b1_map_type='tfl', b1_ref_angle=80.0,
         subject=None, keep_uncorrected=True, fallback_uncorrected=False,
+        denoise_uni=False, extend_fov=False,
         qc=False, work_dir=None, log=print):
 
     # ---- 1. discover series ------------------------------------------------
@@ -120,6 +122,8 @@ def run(inputs, output, *, trflash_ms=7.0, inv_eff=0.96,
             "via --b1-map (or include a tfl FLIP-ANGLE MAP in -i). Without a B1 "
             "map only the uncorrected T1 can be computed.")
     log(f"  B1 source: {'SA2RAGE' if b1_mode == 'sa2rage' else 'B1 map'}")
+    if extend_fov and b1_mode == 'sa2rage':
+        log("  (--b1-extend-fov ignored: it applies to the B1-map source only)")
 
     sub = subject or dio.subject_label(by['uni'])
     log(f"  subject label: {sub}")
@@ -142,6 +146,17 @@ def run(inputs, output, *, trflash_ms=7.0, inv_eff=0.96,
     else:
         log("  (no INV2 supplied -> deriving mask from UNI; ventricles may be filled)")
         mask = brain_mask(np.abs(uni - np.median(uni)))
+
+    # ---- 3b. optional UNI background denoising (O'Brien robust combination) -
+    uni_den = None
+    if denoise_uni:
+        if 'inv1' not in by or 'inv2' not in by:
+            raise SystemExit(
+                "--denoise-uni needs both INV1 and INV2 series (the robust "
+                "combination denoises UNI from the two inversion magnitudes).")
+        inv1 = _load_series(by['inv1'], workdir, 'inv1').get_fdata()
+        uni_den = dn.robust_combination(uni, inv1, inv2)   # inv2 loaded for the mask
+        log("  UNI denoised (O'Brien robust combination, mf=6)")
 
     # ---- 4. uncorrected T1 -------------------------------------------------
     T1u = mp.t1_from_uni(uni, MP['TR'], MP['TIs'], MP['FlipDegrees'],
@@ -235,6 +250,13 @@ def run(inputs, output, *, trflash_ms=7.0, inv_eff=0.96,
         med = float(np.nanmedian(rel[finite])) if finite.any() else 1.0
         rel_f = gaussian_filter(np.where(finite, rel, med).astype(np.float32), 1.0)
         B1_grid = resample_to(nib.Nifti1Image(rel_f, b1_img.affine), uni_img, order=1)
+        if extend_fov:
+            # fill brain voxels outside the measured B1-map FOV (NaN after the
+            # resample) with a smooth degree-3 polynomial rather than B1=0
+            n_out = int((mask & ~np.isfinite(B1_grid)).sum())
+            B1_grid = dn.extend_b1_fov(B1_grid, mask)
+            log(f"  B1 FOV extension: filled {n_out} out-of-FOV brain voxels "
+                f"with a degree-3 polynomial")
         B1_out = B1_grid.copy()
         B1_out[~mask] = np.nan
         mm = mask & np.isfinite(B1_grid) & (B1_grid > 0.1)
@@ -274,6 +296,8 @@ def run(inputs, output, *, trflash_ms=7.0, inv_eff=0.96,
 
     _savenii(np.nan_to_num(T1c), uni_img, os.path.join(t1dir, f'{sub}_T1map.nii.gz'))
     _savenii(np.nan_to_num(B1_out), uni_img, os.path.join(b1dir, f'{sub}_B1map.nii.gz'))
+    if uni_den is not None:
+        _savenii(uni_den, uni_img, os.path.join(output, f'{sub}_UNI-DEN.nii.gz'))
 
     if keep_uncorrected:
         _savenii(T1u, uni_img, os.path.join(t1sub, f'{sub}_T1map_uncorrected.nii.gz'))

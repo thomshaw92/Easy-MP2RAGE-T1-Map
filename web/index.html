@@ -54,6 +54,18 @@
   #stop:hover{border-color:#ff8080;color:#ffb0b0}
   .chk{display:inline-flex;align-items:center;gap:7px;color:var(--ink);font-size:13px;cursor:pointer;user-select:none}
   .chk input{width:15px;height:15px}
+  .tutbtn{margin-left:12px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#08101c;border:none;font-weight:700;border-radius:9px;padding:8px 14px;cursor:pointer}
+  .tutbtn:hover{filter:brightness(1.08)}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px}
+  .modal-card{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:14px;max-width:660px;width:100%;max-height:86vh;overflow:auto;padding:26px 30px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  .modal-card h2{margin:0 0 6px}
+  .modal-close{position:absolute;top:12px;right:12px;background:transparent;border:1px solid var(--line);color:var(--ink);width:30px;height:30px;border-radius:8px;padding:0;cursor:pointer}
+  .modal-close:hover{border-color:var(--accent)}
+  ol.tut{margin:14px 0 6px;padding-left:20px;line-height:1.6}
+  ol.tut li{margin:9px 0}
+  #sliders{display:flex;gap:16px;margin-top:8px;align-items:center}
+  #sliders label{display:flex;align-items:center;gap:6px;flex:1;color:var(--dim);font-size:12px;font-weight:700}
+  #sliders input[type=range]{flex:1;min-width:60px}
   .i:hover::after{content:attr(data-tip);position:absolute;left:0;top:150%;
     background:#0a0d11;border:1px solid var(--line);color:var(--ink);padding:9px 11px;border-radius:9px;
     width:280px;font:400 12px/1.5 -apple-system,sans-serif;text-transform:none;letter-spacing:normal;
@@ -115,9 +127,27 @@
       <div class="tag">Turn your MP2RAGE scans into quantitative <b>T1 maps</b> — corrected for B1 (from SA2RAGE or a B1 map) — and clean up the UNI background with <b>denoising</b>. 3T &amp; 7T.</div>
     </div>
     <span class="badge" title="Nothing is uploaded. Processing happens locally in this browser tab.">🔒 100% in your browser — no data leaves your computer</span>
+    <button class="tutbtn" id="tutorialBtn" title="Step-by-step walkthrough of how to use this tool.">📖 Tutorial</button>
     <button class="secondary reset" id="resetAll" title="Reset everything: clears all loaded images, JSON sidecars, sequence parameters and results, and returns the app to its initial state. Nothing is uploaded or deleted from your disk — this only clears what is loaded in the page.">↺ Reset all</button>
   </div>
 </header>
+
+<div id="tutorialModal" class="modal" style="display:none" role="dialog" aria-modal="true" aria-label="Tutorial">
+  <div class="modal-card">
+    <button class="modal-close" id="tutClose" aria-label="Close tutorial">✕</button>
+    <h2>How to use Easy MP2RAGE T1 Map</h2>
+    <p class="note">Everything runs in your browser. Nothing is uploaded and there is no server.</p>
+    <ol class="tut">
+      <li><b>Add your data.</b> Drag whole <b>DICOM folders</b> (drop several at once) or <b>.nii / .nii.gz</b> files onto the drop zone. Roles (UNI, INV1, INV2, SA2RAGE, B1 map) are guessed from the headers/names — check and fix them in the file table. Click any file (👁) to preview it.</li>
+      <li><b>Confirm the parameters.</b> In step 2, choose where they come from: JSON sidecars, DICOM headers, or type them / use a 7T or 3T preset. TRFLASH is not stored in DICOM — confirm it from your protocol.</li>
+      <li><b>Pick a task.</b> <i>Make T1 map</i> (needs UNI + INV2 + a B1 source: SA2RAGE or a B1 map), <i>SA2RAGE → B1 map</i>, or <i>Denoise UNI → UNI-DEN</i> (needs UNI + INV1 + INV2).</li>
+      <li><b>Compute.</b> Press Compute. Use <b>Verbose log</b> to watch each stage, and <b>Stop</b> to cancel. Turn on <b>Extend B1 map to the full brain FOV</b> only if your B1 map is smaller than the MP2RAGE (the filled region is an estimate).</li>
+      <li><b>Inspect the result.</b> Scroll (mouse-wheel or the sliders) through all three planes, switch outputs and colormaps, and read the T1 histogram (its WM/GM peaks are detected automatically).</li>
+      <li><b>Download.</b> Grab individual NIfTI files, the derived DICOM T1 series (de-identified by default), or everything as one .zip.</li>
+    </ol>
+    <p class="note">Watch for the amber warnings under the file table — they flag non-distortion-corrected (<code>_ND</code>) images and duplicate/mis-assigned series.</p>
+  </div>
+</div>
 
 <details class="about">
   <summary>About this tool &amp; how it works</summary>
@@ -161,7 +191,7 @@
     <h2><span class="step">1</span>Drop your files or DICOM folders
       <span class="i" data-tip="Drag &amp; drop whole DICOM series folders (uncompressed Siemens) — roles and sequence parameters are read from the headers — or .nii / .nii.gz files (with optional dcm2niix .json sidecars). Everything stays on your computer.">i</span>
     </h2>
-    <div id="drop">
+    <div id="drop" tabindex="0" role="button" aria-label="Add files: activate to browse for NIfTI files, or drag and drop DICOM folders and NIfTI files here">
       <b>Drag &amp; drop</b> your <b>DICOM folders</b> — <b>drop several at once</b> — or <b>.nii / .nii.gz</b> files here. (Click to browse for NIfTI files.)<br>
       <span class="note">UNI, INV2, and either a SA2RAGE (2-vol) or a B1 map. DICOM headers auto-fill roles &amp; parameters; <code>.json</code> sidecars do the same for NIfTI. Drag &amp; drop is the best way to add several series at once, and it never shows a browser &ldquo;upload&rdquo; prompt. Nothing is uploaded &mdash; there is no server.</span>
       <input id="file" type="file" multiple accept=".nii,.nii.gz,.json" class="hidden">
@@ -211,8 +241,8 @@
       </h3>
       <div class="grid" id="b1Grid"></div>
       <label class="chk" style="margin-top:10px">
-        <input type="checkbox" id="extendFov" checked> Extend B1 map to the full brain FOV
-        <span class="i" data-tip="If the B1 map covers a smaller field-of-view than the MP2RAGE (common for a low-res tfl B1 map), brain voxels outside it get no correction. B1⁺ transmit fields are spatially smooth, so this fits a low-order 3-D polynomial to the measured field and uses it to fill those voxels. Measured voxels are kept unchanged; filled regions are smooth estimates — check the B1 map output.">i</span>
+        <input type="checkbox" id="extendFov"> Extend B1 map to the full brain FOV (off by default)
+        <span class="i" data-tip="Opt-in. If the B1 map covers a smaller field-of-view than the MP2RAGE (common for a low-res tfl B1 map), brain voxels outside it get no correction. B1⁺ transmit fields are spatially smooth, so this fits a low-order 3-D polynomial to the measured field and uses it to fill those voxels. Measured voxels are kept unchanged; filled regions are estimates, not measurements — check the B1 map output before trusting peripheral T1.">i</span>
       </label>
     </div>
   </div>
@@ -238,6 +268,10 @@
         <input type="checkbox" id="verbose"> Verbose log
         <span class="i" data-tip="When on, the log below shows the exact parameters used, each processing stage as it runs, and summary statistics of every output.">i</span>
       </label>
+      <label class="chk" title="Remove patient identity from the derived DICOM output.">
+        <input type="checkbox" id="deid" checked> De-identify output DICOM
+        <span class="i" data-tip="Only affects the derived DICOM T1 series (produced when the input was a DICOM folder). Removes patient name / ID / birth date, institution, physician and date tags, and private tags, and marks the series de-identified. The NIfTI outputs never contain these tags.">i</span>
+      </label>
       <span id="status" class="note">Add inputs to enable.</span>
     </div>
     <div id="progress" style="margin-top:12px"><div></div></div>
@@ -245,7 +279,7 @@
   </div>
 
   <div class="card" id="viewerWrap">
-    <h2>Result <span class="i" data-tip="Orthogonal slices of the selected output. Use the slider for the axial slice and the colormap menu to restyle. Download the maps below as NIfTI (.nii.gz).">i</span></h2>
+    <h2>Result <span class="i" data-tip="Orthogonal slices of the selected output. Scroll (mouse-wheel over a panel) or drag the A / C / S sliders to move through the axial, coronal and sagittal planes. Change output and colormap above. Download the maps below.">i</span></h2>
     <div class="row" style="margin-bottom:10px">
       <div class="field"><label>View</label>
         <select id="viewSel">
@@ -261,11 +295,15 @@
       <span id="viewStat" class="note" style="align-self:flex-end"></span>
     </div>
     <div id="slices">
-      <canvas id="cax" title="axial"></canvas>
-      <canvas id="cco" title="coronal"></canvas>
-      <canvas id="csa" title="sagittal"></canvas>
+      <canvas id="cax" title="axial — scroll to move through slices"></canvas>
+      <canvas id="cco" title="coronal — scroll to move through slices"></canvas>
+      <canvas id="csa" title="sagittal — scroll to move through slices"></canvas>
     </div>
-    <input id="slice" type="range" min="0" max="100" value="50" title="axial slice">
+    <div id="sliders">
+      <label>A <input id="slice_ax" type="range" min="0" max="100" value="50" title="axial slice"></label>
+      <label>C <input id="slice_co" type="range" min="0" max="100" value="50" title="coronal slice"></label>
+      <label>S <input id="slice_sa" type="range" min="0" max="100" value="50" title="sagittal slice"></label>
+    </div>
     <canvas id="hist" title="T1 histogram (brain)"></canvas>
     <div class="downloads" id="downloads" style="margin-top:12px"></div>
   </div>

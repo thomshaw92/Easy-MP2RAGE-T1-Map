@@ -86,6 +86,7 @@ pub fn parse(bytes: &[u8]) -> Result<DicomFile, String> {
             let vr = [b[*pos], b[*pos + 1]]; *pos += 2;
             let len = if VR_LONG.iter().any(|v| *v == &vr) {
                 *pos += 2; // reserved
+                if *pos + 4 > b.len() { return None; } // 4-byte length must fit
                 let l = u32le(b, *pos) as usize; *pos += 4; l
             } else {
                 let l = u16le(b, *pos) as usize; *pos += 2; l
@@ -100,6 +101,7 @@ pub fn parse(bytes: &[u8]) -> Result<DicomFile, String> {
         let (g, e, vr, len) = match read_elem(bytes, &mut pos, false) { Some(x) => x, None => break };
         if g != 0x0002 { pos = save; break; } // meta group done
         if len == 0xFFFF_FFFF { return Err("undefined-length in meta".into()); }
+        if pos + len > bytes.len() { return Err("truncated DICOM meta element".into()); }
         if g == 0x0002 && e == 0x0010 {
             let uid = ascii(&bytes[pos..pos + len]);
             if uid == "1.2.840.10008.1.2" { implicit = true; }
@@ -122,7 +124,7 @@ pub fn parse(bytes: &[u8]) -> Result<DicomFile, String> {
                     let tg = u16le(bytes, pos); let te = u16le(bytes, pos + 2);
                     let il = u32le(bytes, pos + 4) as usize; pos += 8;
                     if tg == 0xFFFE && te == 0xE0DD { break; }
-                    if il != 0xFFFF_FFFF { pos += il; }
+                    if il != 0xFFFF_FFFF { pos = pos.saturating_add(il); if pos > bytes.len() { break; } }
                 }
             } else { pos += len; }
             continue;
@@ -145,14 +147,16 @@ pub fn parse(bytes: &[u8]) -> Result<DicomFile, String> {
             (0x0020, 0x0013) => df.instance = ascii(v).parse().unwrap_or(0),
             (0x0020, 0x0032) => { let a = ds_multi(v); if a.len() == 3 { df.ipp = [a[0], a[1], a[2]]; } }
             (0x0020, 0x0037) => { let a = ds_multi(v); if a.len() == 6 { df.iop.copy_from_slice(&a); } }
-            (0x0028, 0x0010) => df.rows = u16le(v, 0) as usize,
-            (0x0028, 0x0011) => df.cols = u16le(v, 0) as usize,
+            (0x0028, 0x0010) => { if v.len() >= 2 { df.rows = u16le(v, 0) as usize; } }
+            (0x0028, 0x0011) => { if v.len() >= 2 { df.cols = u16le(v, 0) as usize; } }
             (0x0028, 0x0030) => { let a = ds_multi(v); if a.len() == 2 { df.pixel_spacing = [a[0], a[1]]; } }
-            (0x0028, 0x0100) => df.bits = u16le(v, 0),
-            (0x0028, 0x0103) => df.pixel_rep = u16le(v, 0),
+            (0x0028, 0x0100) => { if v.len() >= 2 { df.bits = u16le(v, 0); } }
+            (0x0028, 0x0103) => { if v.len() >= 2 { df.pixel_rep = u16le(v, 0); } }
             (0x0029, 0x1010) | (0x0029, 0x1020) => csa.extend_from_slice(v),
             (0x7FE0, 0x0010) => {
-                let n = df.rows * df.cols;
+                let n = df.rows.saturating_mul(df.cols);
+                let need = if df.bits == 16 { n.saturating_mul(2) } else { n };
+                if v.len() < need { return Err("truncated or inconsistent pixel data".into()); }
                 let mut px = Vec::with_capacity(n);
                 if df.bits == 16 {
                     for i in 0..n {
@@ -326,7 +330,7 @@ fn parse_all(bytes: &[u8]) -> Result<Vec<Elem>, String> {
                     let tg = u16le(bytes, pos); let te = u16le(bytes, pos + 2);
                     let il = u32le(bytes, pos + 4) as usize; pos += 8;
                     if tg == 0xFFFE && te == 0xE0DD { break; }
-                    if il != 0xFFFF_FFFF { pos += il; }
+                    if il != 0xFFFF_FFFF { pos = pos.saturating_add(il); if pos > bytes.len() { break; } }
                 }
             } else { pos += len; }
             continue;
@@ -353,6 +357,57 @@ fn set_elem(elems: &mut Vec<Elem>, group: u16, elem: u16, vr: &[u8; 2], data: Ve
 }
 fn get_elem<'a>(elems: &'a [Elem], group: u16, elem: u16) -> Option<&'a [u8]> {
     elems.iter().find(|e| e.group == group && e.elem == elem).map(|e| e.data.as_slice())
+}
+/// Strip patient/identifying tags from a single slice's elements in place.
+/// Blanks known identifying tags, drops every private (odd-group) element, and
+/// stamps the PS3.15 de-identification flags. Geometry, pixel data, and the
+/// UIDs that link the object to its study are left untouched.
+fn deidentify_elems(elems: &mut Vec<Elem>) {
+    // Blank known identifying tags to an empty value (VR kept meaningful).
+    let blanks: &[(u16, u16, &[u8; 2])] = &[
+        // Patient identity
+        (0x0010, 0x0010, b"PN"), // PatientName
+        (0x0010, 0x0020, b"LO"), // PatientID
+        (0x0010, 0x0030, b"DA"), // PatientBirthDate
+        (0x0010, 0x0040, b"CS"), // PatientSex
+        (0x0010, 0x1010, b"AS"), // PatientAge
+        (0x0010, 0x1040, b"LO"), // PatientAddress
+        (0x0010, 0x1000, b"LO"), // OtherPatientIDs
+        (0x0010, 0x1001, b"PN"), // OtherPatientNames
+        (0x0010, 0x1005, b"PN"), // PatientBirthName
+        (0x0010, 0x1060, b"PN"), // PatientMotherBirthName
+        (0x0010, 0x2154, b"SH"), // PatientTelephoneNumbers
+        (0x0010, 0x4000, b"LT"), // PatientComments
+        // Institution / physicians / operators
+        (0x0008, 0x0080, b"LO"), // InstitutionName
+        (0x0008, 0x0081, b"ST"), // InstitutionAddress
+        (0x0008, 0x0090, b"PN"), // ReferringPhysicianName
+        (0x0008, 0x1010, b"SH"), // StationName
+        (0x0008, 0x1040, b"LO"), // InstitutionalDepartmentName
+        (0x0008, 0x1050, b"PN"), // PerformingPhysicianName
+        (0x0008, 0x1060, b"PN"), // NameOfPhysiciansReadingStudy
+        (0x0008, 0x1070, b"PN"), // OperatorsName
+        (0x0032, 0x1032, b"PN"), // RequestingPhysician
+        // Dates / times / accession
+        (0x0008, 0x0020, b"DA"), // StudyDate
+        (0x0008, 0x0021, b"DA"), // SeriesDate
+        (0x0008, 0x0022, b"DA"), // AcquisitionDate
+        (0x0008, 0x0023, b"DA"), // ContentDate
+        (0x0008, 0x0030, b"TM"), // StudyTime
+        (0x0008, 0x0031, b"TM"), // SeriesTime
+        (0x0008, 0x0032, b"TM"), // AcquisitionTime
+        (0x0008, 0x0033, b"TM"), // ContentTime
+        (0x0008, 0x0050, b"SH"), // AccessionNumber
+    ];
+    for &(g, e, vr) in blanks {
+        set_elem(elems, g, e, vr, Vec::new());
+    }
+    // Drop every private-group element (odd group number). This also removes the
+    // Siemens CSA group 0x0029, which can carry protocol/patient text.
+    elems.retain(|e| e.group % 2 == 0);
+    // Stamp the PS3.15 de-identification flags.
+    set_elem(elems, 0x0012, 0x0062, b"CS", b"YES".to_vec());
+    set_elem(elems, 0x0012, 0x0063, b"LO", b"Easy-MP2RAGE-T1-Map basic tag removal".to_vec());
 }
 
 fn write_elem(out: &mut Vec<u8>, e: &Elem) {
@@ -389,7 +444,7 @@ fn serialize(elems: &[Elem]) -> Vec<u8> {
 /// Build a derived T1 (ms) DICOM series from the source slices + the computed
 /// volume (i-fastest, same grid/order the source assembled to). `salt` is a
 /// numeric string that makes the generated UIDs unique.
-pub fn write_derived_series(sources: &[&[u8]], t1: &[f32], nx: usize, ny: usize, nz: usize, salt: &str)
+pub fn write_derived_series(sources: &[&[u8]], t1: &[f32], nx: usize, ny: usize, nz: usize, salt: &str, deidentify: bool)
     -> Result<Vec<Vec<u8>>, String> {
     // order source files by position along the slice normal (same as assemble)
     let mut parsed: Vec<(usize, f64)> = Vec::new();
@@ -440,6 +495,9 @@ pub fn write_derived_series(sources: &[&[u8]], t1: &[f32], nx: usize, ny: usize,
         // ensure a Modality is present (keep source's if any)
         if get_elem(&elems, 0x0008, 0x0060).is_none() {
             set_elem(&mut elems, 0x0008, 0x0060, b"CS", b"MR".to_vec());
+        }
+        if deidentify {
+            deidentify_elems(&mut elems);
         }
         files.push(serialize(&elems));
     }

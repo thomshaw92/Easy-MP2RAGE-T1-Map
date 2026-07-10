@@ -7,7 +7,9 @@ use crate::filt::{binary_closing, binary_fill_holes};
 /// `np.percentile(values, q)` with the default 'linear' method.
 pub fn percentile(values: &[f64], q: f64) -> f64 {
     let mut v: Vec<f64> = values.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // total_cmp never panics (partial_cmp().unwrap() panics on a NaN voxel); for
+    // NaN-free inputs it orders identically, so golden parity is preserved.
+    v.sort_by(|a, b| a.total_cmp(b));
     let n = v.len();
     if n == 0 {
         return f64::NAN;

@@ -58,6 +58,11 @@ def build_parser():
     gb.add_argument('--b1-ref-angle', type=float, default=80.0, metavar='DEG',
                     help="Nominal prep flip angle for --b1-map-type tfl "
                          "(Siemens tfl b1map default 80).")
+    gb.add_argument('--b1-extend-fov', action='store_true',
+                    help="Fill brain voxels that fell outside the measured B1-map "
+                         "FOV with a smooth degree-3 polynomial fit (clamped to "
+                         "0.35..1.7) instead of leaving them uncorrected. B1-map "
+                         "source only; ignored with SA2RAGE.")
 
     g2 = p.add_argument_group('SA2RAGE (defaults from header where possible)')
     g2.add_argument('--sa2rage-tr', type=float, default=None, metavar='S',
@@ -73,6 +78,9 @@ def build_parser():
                          "(default: 1.2 s at <=3T, 1.5 s at 7T).")
 
     g3 = p.add_argument_group('output')
+    g3.add_argument('--denoise-uni', action='store_true',
+                    help="Also write a background-denoised UNI (<sub>_UNI-DEN.nii.gz) "
+                         "via the O'Brien robust combination. Needs INV1 and INV2.")
     g3.add_argument('--no-uncorrected', action='store_true',
                     help="Do not write the uncorrected T1 / corrected-UNI derivative files.")
     g3.add_argument('--fallback-uncorrected', action='store_true',
@@ -100,6 +108,7 @@ def main(argv=None):
         b1_ref_angle=args.b1_ref_angle,
         subject=args.subject, keep_uncorrected=not args.no_uncorrected,
         fallback_uncorrected=args.fallback_uncorrected,
+        denoise_uni=args.denoise_uni, extend_fov=args.b1_extend_fov,
         qc=args.qc, work_dir=args.work_dir)
     return 0
 

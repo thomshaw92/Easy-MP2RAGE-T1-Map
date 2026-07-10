@@ -22,7 +22,9 @@ fn linspace(a: f64, b: f64, n: usize) -> Vec<f64> {
 /// bounds_error=False, fill_value=fill)` evaluated at one point.
 fn rgi2(gx: &[f64], gy: &[f64], mat: &Array2<f64>, qx: f64, qy: f64, fill: f64) -> f64 {
     let (nx, ny) = (gx.len(), gy.len());
-    if qx < gx[0] || qx > gx[nx - 1] || qy < gy[0] || qy > gy[ny - 1] {
+    // A NaN query slips past the `<`/`>` bounds test (both false) and would then
+    // panic the binary_search's partial_cmp().unwrap(); treat it as out-of-grid.
+    if qx.is_nan() || qy.is_nan() || qx < gx[0] || qx > gx[nx - 1] || qy < gy[0] || qy > gy[ny - 1] {
         return fill;
     }
     let cell = |g: &[f64], x: f64| -> usize {

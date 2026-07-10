@@ -50,7 +50,8 @@ export async function readNifti(arrayBuffer) {
   for (let i = 1; i <= Math.min(ndim, 4); i++) dims.push(Math.max(1, dv.getInt16(40 + 2 * i, true)));
   while (dims.length < 3) dims.push(1);
   const datatype = dv.getInt16(70, true);
-  const voxOffset = Math.max(352, dv.getFloat32(108, true) | 0);
+  const voxOffsetRaw = dv.getFloat32(108, true); // avoid `| 0` (ToInt32 wraps large offsets)
+  const voxOffset = Number.isFinite(voxOffsetRaw) && voxOffsetRaw >= 352 ? Math.trunc(voxOffsetRaw) : 352;
   let slope = dv.getFloat32(112, true); const inter0 = dv.getFloat32(116, true);
   if (slope === 0 || Number.isNaN(slope)) slope = 1;
   const inter = Number.isNaN(inter0) ? 0 : inter0;
@@ -67,8 +68,14 @@ export async function readNifti(arrayBuffer) {
   }
 
   const n = dims.reduce((a, b) => a * b, 1);
-  const data = new Float32Array(n);
   const off = voxOffset;
+  const bpv = { 16: 4, 64: 8, 4: 2, 512: 2, 8: 4, 2: 1, 256: 1 }[datatype];
+  if (!bpv) throw new Error('unsupported datatype ' + datatype);
+  if (!Number.isSafeInteger(n) || n <= 0) throw new Error('invalid NIfTI dimensions');
+  // Bound the allocation to the real file size, so a header claiming huge dims
+  // cannot trigger a multi-GB allocation / tab OOM before any data is read.
+  if (off + n * bpv > buf.byteLength) throw new Error('NIfTI data is truncated or header dimensions are inconsistent with the file size');
+  const data = new Float32Array(n);
   const get = {
     16: (i) => dv.getFloat32(off + 4 * i, true),
     64: (i) => dv.getFloat64(off + 8 * i, true),
@@ -78,7 +85,6 @@ export async function readNifti(arrayBuffer) {
     2: (i) => dv.getUint8(off + i),
     256: (i) => dv.getInt8(off + i),
   }[datatype];
-  if (!get) throw new Error('unsupported datatype ' + datatype);
   for (let i = 0; i < n; i++) data[i] = get(i) * slope + inter;
   return { data, dims, affine };
 }

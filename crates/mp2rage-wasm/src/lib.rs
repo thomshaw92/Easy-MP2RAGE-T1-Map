@@ -259,14 +259,16 @@ impl DicomOut {
 /// Write a derived T1 (ms) DICOM series from the source DICOM bytes (`concat` +
 /// `offsets`, as passed to `parse_dicom_series`) and the computed T1 volume
 /// (i-fastest, on the source grid). `salt` makes the generated UIDs unique.
+/// When `deidentify` is true, patient/identifying tags and private groups are
+/// stripped from the derived output (study linkage and geometry are preserved).
 #[wasm_bindgen]
-pub fn write_dicom_t1(concat: &[u8], offsets: &[u32], t1: &[f32], dims: &[u32], salt: &str) -> Result<DicomOut, JsValue> {
+pub fn write_dicom_t1(concat: &[u8], offsets: &[u32], t1: &[f32], dims: &[u32], salt: &str, deidentify: bool) -> Result<DicomOut, JsValue> {
     let sources: Vec<&[u8]> = offsets.windows(2).filter_map(|w| {
         let (s, e) = (w[0] as usize, w[1] as usize);
         if e <= concat.len() && s < e { Some(&concat[s..e]) } else { None }
     }).collect();
     let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
-    let files = dicom::write_derived_series(&sources, t1, nx, ny, nz, salt).map_err(|e| JsValue::from_str(&e))?;
+    let files = dicom::write_derived_series(&sources, t1, nx, ny, nz, salt, deidentify).map_err(|e| JsValue::from_str(&e))?;
     let mut data = Vec::new();
     let mut offs = vec![0u32];
     for f in &files {
