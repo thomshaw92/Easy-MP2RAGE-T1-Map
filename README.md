@@ -83,6 +83,35 @@ Check these against your protocol:
       --uni UNI.nii.gz --inv2 INV2.nii.gz --b1-map B1.nii.gz \
       --b1-map-type tfl --b1-extend-fov --out out
 
+## Run the web app locally
+
+The web app is a static site (Rust compiled to WebAssembly). To build and run it
+yourself, following the same approach as QSMbly:
+
+Prerequisites:
+
+- Rust: install from https://rustup.rs/
+- wasm-pack: `cargo install wasm-pack`
+
+Build the WebAssembly and stage it into web/:
+
+    bash tools/build_wasm.sh
+
+Serve the web/ folder over HTTP and open it. It uses ES modules and WebAssembly,
+so it must be served over http, not opened as a file:// path:
+
+    cd web
+    python3 -m http.server 8080
+    # then open http://localhost:8080
+
+Any static file server works (for example `npx serve web`). All processing runs
+client-side; there is no backend and nothing is uploaded.
+
+Tests:
+
+    cargo test                     # Rust core parity + CLI + WASM API
+    node web/test/e2e_node.mjs     # headless data path (WASM in Node)
+
 ## Notes
 
 - DICOM: a Siemens tfl B1 map (TB1TFL) exports two series, an anatomical
