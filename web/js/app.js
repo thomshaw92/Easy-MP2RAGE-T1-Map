@@ -419,14 +419,73 @@ function resetAll() {
 }
 $('#resetAll').onclick = resetAll;
 
-// tutorial modal
-const tutModal = $('#tutorialModal');
-const openTutorial = () => { tutModal.style.display = 'flex'; };
-const closeTutorial = () => { tutModal.style.display = 'none'; };
-$('#tutorialBtn').onclick = openTutorial;
-$('#tutClose').onclick = closeTutorial;
-tutModal.addEventListener('click', (e) => { if (e.target === tutModal) closeTutorial(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && tutModal.style.display === 'flex') closeTutorial(); });
+// ---- interactive guided tour ----------------------------------------------
+const TOUR = [
+  { sel: '#drop', title: '1 · Add your data', body:
+    'Drag whole <b>DICOM folders</b> here (drop several at once) or <b>.nii / .nii.gz</b> files. Roles — UNI, INV1, INV2, SA2RAGE, B1 map — are guessed from the headers/filenames; <b>check and correct them</b> in the Role column of the table that appears. Click any file (👁) to preview it. Amber warnings flag non-distortion-corrected (<code>_ND</code>) images and duplicate or mis-assigned series.' },
+  { sel: '#paramSource', title: '2 · Sequence parameters', body:
+    'Choose where the timing and flip-angle values come from: dropped <b>JSON sidecars</b>, the <b>DICOM headers</b> (auto-filled on import), or type them / use a <b>7T or 3T preset</b>. One value is never stored in DICOM — <b>TRFLASH</b> (the GRE readout TR); confirm it from your protocol, as a 1&nbsp;ms error is about 40&nbsp;ms in T1.' },
+  { sel: '#taskSel', title: '3 · Choose a task', body:
+    '<b>Make T1 map</b> — B1-corrected T1 from MP2RAGE (needs UNI + INV2 + a B1 source: SA2RAGE or a B1 map). <b>SA2RAGE → B1 map</b> — just the relative B1 map. <b>Denoise UNI → UNI-DEN</b> — removes the salt-and-pepper background (needs UNI + INV1 + INV2). If a B1 map is smaller than the MP2RAGE you can optionally extend it to the whole brain; that filled region is an <i>estimate</i>.' },
+  { sel: '#run', title: '4 · Compute', body:
+    'Press <b>Compute</b> to run in a background worker, so the page stays responsive. <b>Stop</b> cancels and keeps your inputs. <b>Verbose log</b> prints the exact parameters, each stage, and output statistics. <b>De-identify output DICOM</b> (on by default) strips patient tags from the derived DICOM series.' },
+  { sel: '#viewerWrap', title: '5 · Read the result', body:
+    'Three orthogonal planes — <b>scroll</b> with the mouse-wheel over a panel or drag the <b>A / C / S</b> sliders. Switch outputs (T1 corrected / uncorrected, B1, UNI) and colormaps. The histogram overlays uncorrected vs corrected T1 and marks the <b>white- and grey-matter peaks</b> automatically (at any field strength).', mayHide: true },
+  { sel: '#downloads', title: '6 · Download', body:
+    'Save each map as <b>NIfTI</b> (.nii.gz), the derived <b>DICOM</b> T1 series (when the input was a DICOM folder), or <b>everything as one .zip</b>. A <code>parameters.json</code> records every value used.', mayHide: true },
+  { sel: '.badge', title: 'Private by design', body:
+    'Everything runs in this browser tab. <b>Nothing is uploaded and there is no server</b> — you can disconnect from the network and it still works. <b>Reset all</b> clears everything to start over.' },
+];
+let tourStep = 0, tourSpotEl = null;
+function tourClearSpot() { if (tourSpotEl) { tourSpotEl.classList.remove('tour-spot'); tourSpotEl = null; } }
+function tourPositionPop(el) {
+  const pop = $('#tourPop');
+  pop.style.visibility = 'hidden'; pop.style.display = 'block';
+  const pw = pop.offsetWidth, ph = pop.offsetHeight, m = 14;
+  let top, left;
+  if (el) {
+    const r = el.getBoundingClientRect();
+    top = r.bottom + m; left = r.left;
+    if (top + ph > innerHeight - 8) top = r.top - ph - m;          // above if no room below
+    top = Math.max(8, Math.min(top, innerHeight - ph - 8));
+    left = Math.max(8, Math.min(left, innerWidth - pw - 8));
+  } else {
+    top = Math.max(8, (innerHeight - ph) / 2); left = (innerWidth - pw) / 2;
+  }
+  pop.style.top = top + 'px'; pop.style.left = left + 'px';
+  pop.style.visibility = 'visible';
+}
+function showTourStep(i) {
+  tourClearSpot();
+  tourStep = Math.max(0, Math.min(TOUR.length - 1, i));
+  const s = TOUR[tourStep];
+  const el = document.querySelector(s.sel);
+  const visible = !!(el && el.offsetParent !== null && el.getClientRects().length);
+  $('#tourStepNo').textContent = `Step ${tourStep + 1} of ${TOUR.length}`;
+  $('#tourTitle').textContent = s.title;
+  $('#tourBody').innerHTML = s.body + (!visible && s.mayHide ? '<br><span class="note">(this section appears once you press Compute)</span>' : '');
+  $('#tourBack').style.visibility = tourStep === 0 ? 'hidden' : 'visible';
+  $('#tourNext').textContent = tourStep === TOUR.length - 1 ? 'Done ✓' : 'Next ›';
+  if (visible) {
+    el.classList.add('tour-spot'); tourSpotEl = el;
+    el.scrollIntoView({ block: 'center' });
+  }
+  tourPositionPop(visible ? el : null);
+  $('#tourNext').focus();
+}
+function startTour() { $('#tour').style.display = 'block'; showTourStep(0); }
+function endTour() { tourClearSpot(); $('#tour').style.display = 'none'; }
+$('#tutorialBtn').onclick = startTour;
+$('#tourNext').onclick = () => { tourStep === TOUR.length - 1 ? endTour() : showTourStep(tourStep + 1); };
+$('#tourBack').onclick = () => showTourStep(tourStep - 1);
+$('#tourSkip').onclick = endTour;
+window.addEventListener('resize', () => { if ($('#tour').style.display === 'block') tourPositionPop(tourSpotEl); });
+document.addEventListener('keydown', (e) => {
+  if ($('#tour').style.display !== 'block') return;
+  if (e.key === 'Escape') endTour();
+  else if (e.key === 'ArrowRight') $('#tourNext').click();
+  else if (e.key === 'ArrowLeft') { if (tourStep > 0) showTourStep(tourStep - 1); }
+});
 
 // Validate inputs/params before dispatching to the worker, so empty/NaN fields,
 // mismatched grids or a non-2-volume SA2RAGE fail with a clear message instead of
