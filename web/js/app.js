@@ -83,9 +83,12 @@ function guessRole(name) {
   // Structural MP2RAGE images are matched BEFORE the weaker b1map/tfl hint:
   // Siemens MP2RAGE is itself a TFL sequence ("tfl3d1"), so "tfl" can appear in
   // UNI/INV filenames and must not shadow their real role.
-  if (/uni/.test(n)) return 'UNI';
+  // Match the inversions first, and anchor the UNI hint to a token boundary, so a
+  // subject/site label containing the trigram "uni" (e.g. sub-uni01, community01)
+  // cannot mislabel an INV image as UNI.
   if (/inv-?2|inv2/.test(n)) return 'INV2';
   if (/inv-?1|inv1/.test(n)) return 'INV1';
+  if (/(?:^|[_.-])uni(?:t1|den)?(?:[_.-]|$)/.test(n)) return 'UNI';
   // A Siemens TFL B1-mapping sequence (TB1TFL / tfl_b1map) also exports an
   // anatomical reference, that one must be ignored, not used for correction.
   if (/tb1tfl|b1map|_b1\b|tfl.?b1|b1.?map/.test(n)) return /anat/.test(n) ? '(ignore)' : 'B1 map';
@@ -566,6 +569,7 @@ $('#run').onclick = async () => {
   log(`\n▶ ${task === 'b1only' ? 'SA2RAGE → B1 map' : mode + ' correction'} …`);
   const inv2Copy = inv2 ? inv2.data.slice() : uniCopy.slice();
   const msg = { mode, uni: uniCopy, inv2: inv2Copy, dims: Uint32Array.from(dims), uniAff: uni.affine, mp: Float64Array.from(mpParams()) };
+  msg.fallback = $('#fallbackUncorr') ? $('#fallbackUncorr').checked : false;
   const transfer = [uniCopy.buffer, inv2Copy.buffer];
   if (mode === 'sa2rage') {
     const saCopy = sa.data.slice();
@@ -637,7 +641,7 @@ async function onResult(res, uni, task, mode, t0) {
   $('#viewerWrap').style.display = 'block';
   showView($('#viewSel').value);
   bidsEnsureColumn();
-  b1SanityWarn();
+  b1SanityWarn(task);
   if (bidsMode && bidsCurrent) await bidsRunComplete(task);
   finishRun();
   setTimeout(() => { $('#progress').style.display = 'none'; setProgress(0); }, 800);
@@ -653,10 +657,11 @@ async function buildDownloads(task, mode, uni) {
       ? [['b1', b1name]]
       : [['t1', 'T1map.nii.gz'], ['b1', b1name], ['t1u', 'T1map_uncorrected.nii.gz'], ['unic', 'UNI_b1corrected.nii.gz']];
   const bundle = []; // {name, data:Uint8Array} for the "download all" zip
+  const primaryKey = items[0] ? items[0][0] : null; // t1 / b1 / unic: the session's saved output
   for (const [key, fname] of items) {
     const o = outputs[key]; if (!o) continue;
     const gz = await writeNiftiGz(o.data, o.dims, o.affine);
-    addLink(dd, new Blob([gz], { type: 'application/gzip' }), fname);
+    addLink(dd, new Blob([gz], { type: 'application/gzip' }), fname, key === primaryKey);
     bundle.push({ name: fname, data: gz });
   }
   // derived DICOM T1 series, only for the T1 task when the UNI input was a DICOM folder
@@ -664,14 +669,17 @@ async function buildDownloads(task, mode, uni) {
     try {
       await ensureWasm();
       const dims = Uint32Array.from(uni.dims.slice(0, 3));
-      const salt = String(Date.now()).slice(-9);
+      // Full millisecond timestamp plus a random suffix: the old low-9-digits salt
+      // wrapped every ~11.5 days, so two exports that far apart could reuse UIDs.
+      // Date.now() starts with a nonzero digit, so the UID component has no leading zero.
+      const salt = String(Date.now()) + String(Math.floor(Math.random() * 1e6)).padStart(6, '0');
       const deid = $('#deid') ? $('#deid').checked : true;
       const dout = write_dicom_t1(uni.src.concat, uni.src.offsets, outputs.t1.data, dims, salt, deid);
       log(deid ? '  DICOM: output will be de-identified (patient tags removed)' : '  DICOM: output keeps source patient tags (de-identify unchecked)');
       const data = dout.data, offs = dout.offsets, files = [];
       for (let i = 0; i < offs.length - 1; i++)
         files.push({ name: `T1map_${String(i + 1).padStart(4, '0')}.dcm`, data: data.subarray(offs[i], offs[i + 1]) });
-      addLink(dd, new Blob([zipStore(files)], { type: 'application/zip' }), 'T1map_DICOM.zip');
+      addLink(dd, new Blob([zipStore(files)], { type: 'application/zip' }), 'T1map_DICOM.zip', true);
       for (const f of files) bundle.push({ name: `T1map_DICOM/${f.name}`, data: f.data });
       log(`  DICOM: derived ${files.length}-slice T1 series ready (.zip)`);
     } catch (e) { log('DICOM export skipped: ' + e); }
@@ -687,16 +695,23 @@ async function buildDownloads(task, mode, uni) {
   bundle.push({ name: 'parameters.json', data: provBytes });
   // "download all", one zip of every derivative, shown first and highlighted
   if (bundle.length > 1) {
-    const a = addLink(dd, new Blob([zipStore(bundle)], { type: 'application/zip' }), 'all_derivatives.zip');
+    const a = addLink(dd, new Blob([zipStore(bundle)], { type: 'application/zip' }), 'all_derivatives.zip', true);
     a.textContent = '⬇ Download all (.zip)';
     a.style.fontWeight = '700';
     a.style.borderColor = 'var(--accent)';
     dd.insertBefore(a, dd.firstChild);
   }
 }
-function addLink(parent, blob, fname) {
+function addLink(parent, blob, fname, savesResult = false) {
   const url = URL.createObjectURL(blob); objectUrls.push(url);
   const a = document.createElement('a'); a.href = url; a.download = fname; a.textContent = '⬇ ' + fname;
+  // Saving the session's result from the docked viewer must clear the "not
+  // downloaded" state, else loadBidsEntry pops a false eviction prompt (and frees
+  // the blob) for a result the user already saved. Only links that actually carry
+  // the primary output count.
+  if (savesResult) a.addEventListener('click', () => {
+    if (bidsMode && bidsCurrent && bidsCurrent._state === 'done') { bidsCurrent._downloaded = true; updateBidsActions(bidsCurrent); }
+  });
   parent.appendChild(a);
   return a;
 }
@@ -756,12 +771,16 @@ function robustRange(data) {
 
 // Load an input volume into the same slice viewer used for outputs, so inputs
 // can be checked visually before/after running.
-function previewInput(f) {
+function previewInput(f, includeResultViews = true) {
   if (!f || !f.data || !f.data.length) { log(`cannot preview ${f?.name || '?'} (no data, re-add the file)`); return; }
   const dims = (f.dims || []).slice(0, 3);
   outputs.__preview = { data: f.data, dims, affine: f.affine, label: 'INPUT · ' + f.name, range: robustRange(f.data), cmap: 'gray' };
   const label = 'INPUT · ' + f.name + (f.role && f.role !== '(ignore)' ? ` (${f.role})` : '');
-  setupViews([['__preview', label], ...(lastViews || [])]);
+  // Only offer the in-memory result views alongside the preview when they belong
+  // to THIS input's session; a cross-session chip preview must not surface another
+  // subject's outputs in the view selector.
+  const extra = includeResultViews ? (lastViews || []) : [];
+  setupViews([['__preview', label], ...extra]);
   resetPlanes(dims);
   $('#viewerWrap').style.display = 'block';
   $('#viewSel').value = '__preview';
@@ -906,7 +925,7 @@ function topTwoModes(sm, nb, binT1) {
 // varies smoothly. If it is far from 1.0 or wildly non-uniform, the "B1 map" is
 // probably a magnitude/anatomical image or the wrong units, and the corrected T1
 // is invalid; warn and point the user to the uncorrected T1.
-function b1SanityWarn() {
+function b1SanityWarn(task) {
   const w = $('#viewWarn'); if (!w) return;
   const o = outputs.b1;
   if (!o || !o.data) { w.style.display = 'none'; return; }
@@ -916,12 +935,20 @@ function b1SanityWarn() {
   v.sort((a, b) => a - b);
   const q = (p) => v[Math.min(v.length - 1, Math.floor(v.length * p))];
   const med = q(0.5), spread = med > 0 ? (q(0.9) - q(0.1)) / med : 99;
-  if (med < 0.6 || med > 1.5 || spread > 0.85) {
+  // A real B1+ transmit field sits near 1.0. The median is the reliable tell for
+  // a magnitude/anatomical image or wrong units. Spread alone is not: a genuine
+  // 7T field with cerebellar/temporal drop-out can reach ~0.9, so only treat a
+  // very high spread as suspicious when the median is also off (avoids flagging
+  // legitimate strong-but-smooth 7T inhomogeneity).
+  const bad = med < 0.5 || med > 1.7 || (spread > 1.0 && (med < 0.75 || med > 1.3));
+  if (bad) {
+    const advise = task === 'b1only'
+      ? `This B1 map is unlikely to give a valid correction; check that you selected a flip-angle map (not an anatomical/magnitude image) and the correct B1 type.`
+      : `The B1-corrected T1 is likely invalid. Switch the View to <b>T1 uncorrected</b> (also in the downloads), or supply a proper B1 map.`;
     w.innerHTML = `<b>⚠ This B1 map does not look like a B1⁺ field</b> (relative B1 median ${med.toFixed(2)}; a real transmit field sits near 1.0 and varies smoothly). ` +
-      `The input may be a magnitude/anatomical image rather than a flip-angle map, or the units/type are wrong. ` +
-      `The B1-corrected T1 is likely invalid. Switch the View to <b>T1 uncorrected</b> (also in the downloads), or supply a proper B1 map.`;
+      `The input may be a magnitude/anatomical image rather than a flip-angle map, or the units/type are wrong. ` + advise;
     w.style.display = 'block';
-    log(`⚠ B1 sanity: relative B1 median ${med.toFixed(2)} (expected ~1.0); correction likely invalid; prefer the uncorrected T1.`);
+    log(`⚠ B1 sanity: relative B1 median ${med.toFixed(2)} (expected ~1.0); this does not look like a B1⁺ field.`);
   } else {
     w.style.display = 'none';
   }
@@ -1035,7 +1062,30 @@ $('#pickBids').onclick = () => $('#bidsInput').click();
 $('#bidsInput').onchange = (e) => loadBidsDirectory(e.target.files);
 $('#bidsClose').onclick = closeBids;
 $('#bidsNext').onclick = calculateNextBidsEntry;
-// the BIDS verbose toggle drives the shared #verbose used by the run path
+// Apply a session's per-session options (extend-FOV / fallback / denoise β) plus the
+// batch verbose toggle to the shared run controls, right before it is run.
+function applyBidsSessionOptions(ses) {
+  if ($('#extendFov')) $('#extendFov').checked = !!ses._extendFov;
+  if ($('#fallbackUncorr')) $('#fallbackUncorr').checked = !!ses._fallback;
+  if ($('#reg')) $('#reg').value = ses._reg;
+  if ($('#verbose') && $('#bidsVerbose')) $('#verbose').checked = $('#bidsVerbose').checked;
+}
+// The toolbar option controls are BATCH DEFAULTS: changing one re-seeds every
+// not-yet-run session and re-renders it (per-session controls still override).
+function reseedBidsDefaults() {
+  if (!bidsIndex || !bidsIndex._flat) return;
+  for (const s of bidsIndex._flat) {
+    if (s._state === 'pending') {
+      s._extendFov = !!$('#bidsExtendFov').checked;
+      s._fallback = !!$('#bidsFallback').checked;
+      s._reg = +$('#bidsReg').value || 6;
+      if (s._el) rerenderBidsSession(s);
+    }
+  }
+}
+$('#bidsExtendFov').onchange = reseedBidsDefaults;
+$('#bidsFallback').onchange = reseedBidsDefaults;
+$('#bidsReg').onchange = reseedBidsDefaults; // change (not input) to avoid re-rendering the tree per keystroke
 $('#bidsVerbose').onchange = () => { if ($('#verbose')) $('#verbose').checked = $('#bidsVerbose').checked; };
 
 function closeBids() {
@@ -1101,6 +1151,10 @@ const roleLabel = (rk) => ({ UNI: 'UNI', INV1: 'INV1', INV2: 'INV2', B1SOURCE: '
 function bidsInitSession(ses) {
   if (ses._task === undefined) ses._task = ses.runnable.t1 ? 't1' : ses.runnable.b1only ? 'b1only' : ses.runnable.denoise ? 'denoise' : null;
   if (ses._editRole === undefined) ses._editRole = 'UNI';
+  // per-session processing options (seeded from the toolbar batch defaults)
+  if (ses._extendFov === undefined) ses._extendFov = !!($('#bidsExtendFov') && $('#bidsExtendFov').checked);
+  if (ses._fallback === undefined) ses._fallback = !!($('#bidsFallback') && $('#bidsFallback').checked);
+  if (ses._reg === undefined) ses._reg = ($('#bidsReg') ? +$('#bidsReg').value : 6) || 6;
 }
 function bidsTasks(ses) {
   const t = [];
@@ -1130,13 +1184,40 @@ function fillReassign(ses, sel) {
   }
 }
 function rerenderBidsSession(ses) {
+  const old = ses._el; // capture BEFORE render (renderBidsSession reassigns ses._el)
   const fresh = renderBidsSession(ses);
-  if (ses._el && ses._el.parentNode) ses._el.parentNode.replaceChild(fresh, ses._el);
+  if (old && old.parentNode) old.parentNode.replaceChild(fresh, old);
 }
 function bidsAssignRole(ses, rk, file) {
   ses._roles[rk] = file;
   if (rk === 'B1SOURCE') ses.b1kind = file ? (/tb1srge/i.test(file.path) ? 'sa2rage' : 'b1map') : ses.b1kind;
-  if (['loaded', 'done', 'unloaded'].includes(ses._state)) ses._state = 'pending'; // inputs changed, recompute
+  // Refresh only THIS role's status, from an actual filename check so a mismatched
+  // hand-pick is flagged (warn) rather than shown as a validated green chip. Other
+  // roles' statuses stay intact.
+  ses.status = { ...ses.status, [rk]: file
+    ? (roleFits(rk, file.path)
+        ? { state: 'ok', reason: 'manually assigned' }
+        : { state: 'warn', reason: `manually assigned; ${baseName(file.path)} does not look like a ${roleLabel(rk)}` })
+    : { state: 'missing', reason: 'not assigned' } };
+  // Reassigning inputs invalidates any computed result. If it is done but unsaved,
+  // offer to download it before it is discarded, then free its blob (previously it
+  // leaked and became UI-unreachable with no prompt).
+  if (['loaded', 'done', 'unloaded'].includes(ses._state)) {
+    if (ses._dlUrl) {
+      let triggered = false;
+      if (!ses._downloaded &&
+          confirm(`Reassigning ${roleLabel(rk)} discards the computed result for ${entryLabel(ses)} (${ses._dlName}), which has not been downloaded. Download it first?`)) {
+        bidsDownload(ses); triggered = true;
+      }
+      if (triggered) deferRevoke(ses._dlUrl);
+      else { try { URL.revokeObjectURL(ses._dlUrl); } catch (e) { /* */ } }
+      ses._dlUrl = null;
+    }
+    ses._state = 'pending'; // inputs changed, recompute
+  }
+  // Keep the index-time warnings (they may flag a real problem with an untouched
+  // role) but mark them possibly-stale instead of wiping them silently.
+  ses._edited = true;
   bidsRecomputeRunnable(ses);
   rerenderBidsSession(ses);
 }
@@ -1177,8 +1258,25 @@ function renderBidsSession(ses) {
     const tl = document.createElement('label'); tl.textContent = 'Task: ';
     const tsel = document.createElement('select');
     for (const [v, lbl] of tasks) { const o = document.createElement('option'); o.value = v; o.textContent = lbl; if (v === ses._task) o.selected = true; tsel.appendChild(o); }
-    tsel.onchange = () => { ses._task = tsel.value; updateBidsActions(ses); };
+    tsel.onchange = () => { ses._task = tsel.value; rerenderBidsSession(ses); }; // re-render so the task-specific options update
     tl.appendChild(tsel); ctrl.appendChild(tl);
+  }
+  // task-contextual per-session options
+  const mkChk = (labelTxt, checked, onToggle, title) => {
+    const l = document.createElement('label'); l.className = 'chk'; if (title) l.title = title;
+    const c = document.createElement('input'); c.type = 'checkbox'; c.checked = checked; c.onchange = () => onToggle(c.checked);
+    l.appendChild(c); l.appendChild(document.createTextNode(' ' + labelTxt)); ctrl.appendChild(l);
+  };
+  if (ses._task === 't1') {
+    if (ses.b1kind === 'b1map') mkChk('extend B1 FOV', ses._extendFov, (v) => { ses._extendFov = v; }, 'Extend a too-small B1 map to the whole brain (filled regions are estimates).');
+    mkChk('fill non-converged', ses._fallback, (v) => { ses._fallback = v; }, 'Fill non-converged T1 voxels (mostly CSF / long-T1) with the uncorrected T1.');
+  }
+  if (ses._task === 'denoise') {
+    const l = document.createElement('label'); l.className = 'chk'; l.title = 'Denoise strength (larger removes more background).';
+    l.appendChild(document.createTextNode('denoise β '));
+    const n = document.createElement('input'); n.type = 'number'; n.value = ses._reg; n.step = '1'; n.min = '1'; n.style.width = '52px';
+    n.oninput = () => { ses._reg = +n.value || 6; };
+    l.appendChild(n); ctrl.appendChild(l);
   }
   const rl = document.createElement('label'); rl.className = 'bids-reassign'; rl.appendChild(document.createTextNode('Reassign '));
   const rn = document.createElement('b'); rn.textContent = roleLabel(ses._editRole); rl.appendChild(rn); rl.appendChild(document.createTextNode(': '));
@@ -1186,9 +1284,10 @@ function renderBidsSession(ses) {
   rsel.onchange = () => bidsAssignRole(ses, ses._editRole, (ses.files || []).find((f) => f.path === rsel.value) || null);
   rl.appendChild(rsel); ctrl.appendChild(rl);
   box.appendChild(ctrl);
-  // warnings
+  // warnings (index-time QC; flagged stale once the user has hand-edited roles)
   if (ses.warnings?.length) {
-    const w = document.createElement('div'); w.className = 'bids-warn'; w.textContent = '⚠ ' + ses.warnings.join('  ·  ');
+    const note = ses._edited ? 'roles manually edited, these index-time notes may be stale  ·  ' : '';
+    const w = document.createElement('div'); w.className = 'bids-warn'; w.textContent = '⚠ ' + note + ses.warnings.join('  ·  ');
     box.appendChild(w);
   }
   // actions
@@ -1211,7 +1310,15 @@ function updateBidsActions(ses) {
   const act = ses._actEl; if (!act) return;
   act.innerHTML = '';
   const mk = (txt, fn, cls) => { const b = document.createElement('button'); b.type = 'button'; if (cls) b.className = cls; b.textContent = txt; b.onclick = fn; act.appendChild(b); return b; };
-  const dlLink = () => { if (!ses._dlUrl) return; const a = document.createElement('a'); a.href = ses._dlUrl; a.download = ses._dlName; a.textContent = '⬇ ' + ses._dlName; act.appendChild(a); };
+  const dlLink = () => {
+    if (!ses._dlUrl) return;
+    const a = document.createElement('a'); a.href = ses._dlUrl; a.download = ses._dlName;
+    a.textContent = (ses._downloaded ? '⬇ ' : '⬇ Download ') + ses._dlName;
+    a.title = ses._downloaded ? 'already downloaded' : 'not downloaded yet';
+    if (!ses._downloaded) a.style.fontWeight = '700';
+    a.onclick = () => { ses._downloaded = true; };
+    act.appendChild(a);
+  };
   if (ses._state === 'running') { const s = document.createElement('span'); s.className = 'bids-status'; s.textContent = 'processing… (Stop to cancel)'; act.appendChild(s); return; }
   if (ses._state === 'done') {
     dlLink();
@@ -1247,7 +1354,9 @@ async function previewBidsRole(ses, rk, rlabel) {
     $('#viewStat').textContent = `reading ${baseName(f.path)} …`;
     const buf = await f.file.arrayBuffer();
     const nii = await readNifti(buf);
-    previewInput({ name: baseName(f.path), dims: nii.dims, affine: nii.affine, data: nii.data, role: appRole });
+    // Reading another session's file on demand: its result is not in memory, so
+    // do not append lastViews (which belongs to whatever session is current).
+    previewInput({ name: baseName(f.path), dims: nii.dims, affine: nii.affine, data: nii.data, role: appRole }, false);
   } catch (e) { log(`BIDS: could not preview ${baseName(f.path)}: ${e}`); }
 }
 
@@ -1258,10 +1367,22 @@ async function loadBidsEntry(ses, opts = {}) {
   if (bidsLoading) { log('BIDS: a session is still loading, one moment.'); return false; }
   bidsLoading = true;
   const scroll = opts.scroll !== false;
-  // starting a different session unloads the previous done result (and frees its download blob)
+  // starting a different session unloads the previous done result (and frees its
+  // download blob). Prompt to download it first if it hasn't been saved.
   if (bidsCurrent && bidsCurrent !== ses && bidsCurrent._state === 'done') {
     const prev = bidsCurrent;
-    if (prev._dlUrl) { try { URL.revokeObjectURL(prev._dlUrl); } catch (e) { /* */ } prev._dlUrl = null; }
+    let triggered = false;
+    if (prev._dlUrl && !prev._downloaded &&
+        confirm(`The result for ${entryLabel(prev)} (${prev._dlName}) has not been downloaded and will be freed to make room for the next session. Download it now?`)) {
+      bidsDownload(prev); triggered = true;
+    }
+    if (prev._dlUrl) {
+      // If we just kicked off a download, defer the revoke so it isn't aborted;
+      // otherwise the blob is unused and can be freed now.
+      if (triggered) deferRevoke(prev._dlUrl);
+      else { try { URL.revokeObjectURL(prev._dlUrl); } catch (e) { /* */ } }
+      prev._dlUrl = null;
+    }
     prev._state = 'unloaded'; updateBidsStatus(prev); updateBidsActions(prev);
   }
   bidsCurrent = ses;
@@ -1287,8 +1408,17 @@ async function loadBidsEntry(ses, opts = {}) {
     for (const sc of (ses.sidecars || [])) {
       try { state.jsons.push({ name: baseName(sc.path), json: JSON.parse(await sc.file.text()) }); } catch (e) { /* ignore */ }
     }
+    // Reset the parameter form to a field-appropriate preset FIRST, so values never
+    // leak from the previous session; then overlay this session's sidecar values.
+    // Coerce first: real sidecars sometimes store MagneticFieldStrength as a
+    // string ("7", "6.98"), which Number.isFinite() would reject and silently
+    // fall back to the 3T preset for a 7T scan.
+    const b0 = state.jsons.map((j) => parseFloat(j.json.MagneticFieldStrength)).find((v) => Number.isFinite(v));
+    applyPreset(b0 && b0 >= 6.5 ? '7T' : '3T');
     if (state.jsons.length) { for (const j of state.jsons) applySidecar(j.name, j.json); $('#paramSource').value = 'json'; $('#paramSrcNote').textContent = 'from sidecars'; }
+    else $('#paramSrcNote').textContent = (b0 && b0 >= 6.5 ? '7T' : '3T') + ' preset (no sidecars)';
     if (ses.b1kind !== 'sa2rage' && $('#b1_type')) $('#b1_type').value = b1type;
+    applyBidsSessionOptions(ses); // this session's extend-FOV / fallback / denoise β
     $('#taskSel').value = ses._task || (ses.runnable.t1 ? 't1' : ses.runnable.denoise ? 'denoise' : 't1');
     renderTable(); refreshRunState();
     ses._state = 'loaded'; updateBidsStatus(ses); updateBidsActions(ses);
@@ -1331,6 +1461,34 @@ function bidsOutName(ses, task) {
   return `${stem}_T1map.nii.gz`;
 }
 
+// Revoke a blob URL that was just handed to a click()-triggered download on a
+// later tick. Revoking synchronously right after a.click() can abort the still-
+// queued download (the browser has not finished reading the blob yet), which on
+// Firefox/Safari and multi-MB files silently loses the file. A short defer lets
+// the download task grab the blob first, then frees it.
+function deferRevoke(url) {
+  if (!url) return;
+  setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) { /* */ } }, 4000);
+}
+
+// Light sanity check that a manually reassigned file plausibly matches the role,
+// so a hand-picked mismatch is flagged rather than shown as a validated green chip.
+function roleFits(rk, path) {
+  const b = String(path || '').toLowerCase();
+  if (rk === 'UNI') return /unit1|_uni|uniden|mp2rage|_t1w/.test(b);
+  if (rk === 'INV1') return /inv-?1/.test(b) || /_mp2rage/.test(b);
+  if (rk === 'INV2') return /inv-?2/.test(b) || /_mp2rage/.test(b);
+  if (rk === 'B1SOURCE') return /tb1tfl|tb1srge|tb1map|rb1cor|b1|fmap|sa2rage/.test(b);
+  return true;
+}
+
+function bidsDownload(ses) {
+  if (!ses._dlUrl) return;
+  const a = document.createElement('a'); a.href = ses._dlUrl; a.download = ses._dlName; a.style.display = 'none';
+  document.body.appendChild(a); a.click(); a.remove();
+  ses._downloaded = true;
+}
+
 async function bidsRunComplete(task) {
   const ses = bidsCurrent; if (!ses) return;
   ses._state = 'done'; updateBidsStatus(ses);
@@ -1341,12 +1499,9 @@ async function bidsRunComplete(task) {
     const gz = await writeNiftiGz(o.data, o.dims, o.affine);
     if (ses._dlUrl) { try { URL.revokeObjectURL(ses._dlUrl); } catch (e) { /* */ } }
     ses._dlUrl = URL.createObjectURL(new Blob([gz], { type: 'application/gzip' }));
-    ses._dlName = fname;
-    if ($('#bidsAutoDl')?.checked) {
-      const a = document.createElement('a'); a.href = ses._dlUrl; a.download = fname; a.style.display = 'none';
-      document.body.appendChild(a); a.click(); a.remove();
-      log(`BIDS: ${entryLabel(ses)} → downloaded ${fname}`);
-    } else log(`BIDS: ${entryLabel(ses)} done → ${fname} (download in the panel)`);
+    ses._dlName = fname; ses._downloaded = false;
+    if ($('#bidsAutoDl')?.checked) { bidsDownload(ses); log(`BIDS: ${entryLabel(ses)} → downloaded ${fname}`); }
+    else log(`BIDS: ${entryLabel(ses)} done → ${fname}. Review it, then download it (⬇ on the row) before the next session.`);
   }
   updateBidsActions(ses);
   $('#viewerWrap').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1364,11 +1519,9 @@ function freeWorker() { if (worker && !running) { try { worker.terminate(); } ca
 
 // Save the output (if not already) and free ALL of this session's memory.
 function downloadUnloadBids(ses) {
-  if (ses._dlUrl) {
-    const a = document.createElement('a'); a.href = ses._dlUrl; a.download = ses._dlName; a.style.display = 'none';
-    document.body.appendChild(a); a.click(); a.remove();
-    try { URL.revokeObjectURL(ses._dlUrl); } catch (e) { /* */ } ses._dlUrl = null; // file is saved; drop the blob
-  }
+  const had = !!ses._dlUrl;
+  bidsDownload(ses);
+  if (ses._dlUrl) { if (had) deferRevoke(ses._dlUrl); ses._dlUrl = null; } // saved; free the blob after the download task grabs it
   clearOutputs(); state.files = []; state.jsons = []; lastViews = null;
   revokeDownloadUrls();
   bidsShowPlaceholder();

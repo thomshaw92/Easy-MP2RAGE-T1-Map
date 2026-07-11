@@ -39,13 +39,13 @@ self.onmessage = async (e) => {
       res = t1map_sa2rage(
         msg.uni, msg.inv2, msg.sa,
         msg.dims, msg.uniAff, msg.saDims, msg.saAff,
-        msg.mp, msg.saP,
+        msg.mp, msg.saP, !!msg.fallback,
       );
     } else if (msg.mode === 'b1map') {
       res = t1map_b1(
         msg.uni, msg.inv2, msg.b1,
         msg.dims, msg.uniAff, msg.b1Dims, msg.b1Aff,
-        msg.kind, msg.refAngle, msg.mp, !!msg.extendFov,
+        msg.kind, msg.refAngle, msg.mp, !!msg.extendFov, !!msg.fallback,
       );
     } else {
       throw new Error(`unknown mode: ${msg.mode}`);

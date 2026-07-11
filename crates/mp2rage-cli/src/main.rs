@@ -17,7 +17,7 @@ fn usage() -> ! {
     eprintln!(
         "usage:\n  mp2rage-t1map --uni U.nii[.gz] --inv2 I.nii --sa2rage S.nii --out DIR\n  \
          mp2rage-t1map --uni U.nii --inv2 I.nii --b1-map B.nii [--b1-map-type tfl|percent|relative] \
-         [--b1-ref-angle 80] [--b1-extend-fov] --out DIR\n\n\
+         [--b1-ref-angle 80] [--b1-extend-fov] [--fallback-uncorrected] --out DIR\n\n\
          MP2RAGE params (defaults 7T): --mp-tr 4.3 --mp-ti 0.840 2.370 --mp-fa 5 6 \
          --mp-nz 64 128 --mp-trflash 0.007 --inv-eff 0.96\n\
          SA2RAGE params: --sa-tr 2.4 --sa-ti 0.150 1.500 --sa-fa 6 6 --sa-nz 24 24 \
@@ -98,6 +98,7 @@ fn main() {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => usage(),
     };
+    let fallback = m.contains_key("fallback-uncorrected");
 
     let mp = Mp2rageParams {
         tr: f(&m, "mp-tr", 0, 4.3),
@@ -135,14 +136,14 @@ fn main() {
             None => { eprintln!("SA2RAGE must be a 2-volume (S1,S2) image"); exit(1); }
         };
         println!("[SA2RAGE B1 source]");
-        run_sa2rage(uni, inv2, &sa_v.c0, s_b, &uni_v.affine, &sa_v.affine, &mp, &sa)
+        run_sa2rage(uni, inv2, &sa_v.c0, s_b, &uni_v.affine, &sa_v.affine, &mp, &sa, fallback)
     } else if let Some(b1_p) = path(&m, "b1-map") {
         let kind = m.get("b1-map-type").and_then(|v| v.first()).map(|s| s.as_str()).unwrap_or("tfl");
         let ref_angle = f(&m, "b1-ref-angle", 0, 80.0);
         let extend_fov = m.contains_key("b1-extend-fov");
         let b1_v = load_(b1_p);
         println!("[B1-map source: type={kind}, extend-fov={extend_fov}]");
-        run_b1map(uni, inv2, &b1_v.c0, &uni_v.affine, &b1_v.affine, kind, ref_angle, &mp, extend_fov)
+        run_b1map(uni, inv2, &b1_v.c0, &uni_v.affine, &b1_v.affine, kind, ref_angle, &mp, extend_fov, fallback)
     } else {
         eprintln!("need --sa2rage or --b1-map");
         usage();

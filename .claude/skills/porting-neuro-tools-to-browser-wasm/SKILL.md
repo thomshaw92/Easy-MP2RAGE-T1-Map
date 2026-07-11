@@ -1,233 +1,419 @@
 ---
 name: porting-neuro-tools-to-browser-wasm
 description: >
-  Playbook for building a 100%-client-side, in-browser neuroimaging tool (QSMBLY /
+  Playbook for building a 100%-client-side, in-browser neuroimaging tool (QSMbly /
   NeuroDesk style) by porting a reference Python/MATLAB pipeline to Rust + WebAssembly.
   Use when the goal is a drag-and-drop web app that reads DICOM/NIfTI, processes
-  entirely in the browser (no upload, PHI-safe), and downloads NIfTI/DICOM — with the
-  numeric core validated bit-for-bit against the reference. Covers the workspace
-  layout, the hard-won bit-exact parity gotchas, DICOM/NIfTI I/O, the privacy/safety
-  model, GitHub Pages + NeuroDesk deploy, and an adversarial multi-agent review pass.
+  entirely in the browser (no upload, PHI-safe), and downloads NIfTI/DICOM, with the
+  numeric core validated bit-for-bit against the reference. Covers workspace layout,
+  the bit-exact parity gotchas, DICOM/NIfTI I/O, single-vs-BIDS input modes, a BIDS
+  batch mode with a permanent docked viewer, the review-first download flow, privacy,
+  GitHub Pages + NeuroDesk deploy, and the adversarial multi-agent review discipline.
 ---
 
 # Porting a neuroimaging pipeline to an in-browser Rust/WASM app
 
 Goal: turn a reference implementation (Python/MATLAB, e.g. the Marques MP2RAGE
-scripts) into a static web app that runs the whole pipeline **locally in the
-browser tab** — no server, no upload — and downloads results. The numeric core is
-Rust, compiled to WASM, and validated to match the reference to machine precision.
+scripts) into a static web app that runs the whole pipeline locally in the browser
+tab (no server, no upload) and downloads results. The numeric core is Rust,
+compiled to WASM, validated to match the reference to machine precision.
 
-This is the exact recipe used to build "Easy MP2RAGE T1 Map" (T1 mapping, B1
-correction, UNI denoising). Reuse it for any similar tool (QSM, R2*, fieldmaps,
-segmentation post-proc, etc.).
+This is the recipe used to build "Easy MP2RAGE T1 Map" (T1 mapping, B1 correction,
+UNI denoising, plus a BIDS batch mode). It reuses for any similar tool (QSM, R2*,
+fieldmaps, segmentation post-proc). Sections 6 to 15 cover the browser app, BIDS
+mode, and the review discipline, which are the parts easiest to get wrong.
 
-## 0. Decide the split before writing code
+## 0. Project conventions (apply from the start)
 
-- **What's the reference?** Get the canonical Python/MATLAB. It is the source of
-  truth. You will port it, not reinvent it.
-- **Data is PHI.** The repo must contain **zero** subject data. Keep test data
-  outside the repo and gitignore aggressively (see §7).
-- **Deliverable shape:** three implementations sharing one validated core —
-  reference Python (kept), a Rust port (core + CLI + WASM), and the static web app.
+Apply these from the start to avoid a later cleanup sweep of the whole codebase:
 
-## 1. Workspace layout
+- **No em dashes or en dashes anywhere**, in the page, the tutorial, comments, or
+  docs. Use plain hyphens, commas, periods, and parentheses. A quick sweep (the
+  regex targets em dash U+2014 and en dash U+2013 by escape, so the code itself
+  stays dash-free):
+  `node -e 'const fs=require("fs");for(const f of process.argv.slice(1)){let s=fs.readFileSync(f,"utf8");s=s.replace(/(\\d)[ \\t]*\\u2013[ \\t]*(\\d)/g,"$1-$2").replace(/[ \\t]*[\\u2014\\u2013][ \\t]*/g,", ");fs.writeFileSync(f,s)}' web/index.html web/js/*.js`
+  then hand-fix any comma splices it creates in the most visible strings.
+- **No marketing or "AI" tone.** Plain, direct, concrete. The README leads with the
+  live site and "what it is / what it is based on", then a barebones CLI section. No
+  "seamless", "powerful", "effortless", "unlock", no exclamation-heavy copy.
+- **Scope privacy claims to the data.** Once analytics is added, "nothing leaves your
+  computer" is false; say "your images never leave your browser" and disclose the
+  analytics honestly (see section 12).
+- **Never commit or push.** Draft commit messages when asked; the user runs git. Keep
+  commit messages short (subject + a few bullets), and end with the Co-Authored-By
+  trailer if requested.
+- **Validate on real data, not just the phantom.** Run real subjects through the CLI
+  and render slices to check before declaring anything works.
+
+## 1. Decide the split before writing code
+
+- **What is the reference?** Get the canonical Python/MATLAB. It is the source of
+  truth. Port it, do not reinvent it.
+- **Data is PHI.** The repo contains ZERO subject data. Keep test data outside the
+  repo and gitignore aggressively (section 14).
+- **Deliverable shape:** three implementations sharing one validated core: reference
+  Python (kept), a Rust port (core + CLI + WASM), and the static web app.
+
+## 2. Workspace layout
 
 ```
 crates/
-  <tool>-core/     pure Rust, no wasm/web deps — ALL the maths, unit-tested
-    src/{model,correct,interp,filt,mask,resample,pipeline,dicom,denoise,...}.rs
-  <tool>-cli/      native CLI over the core (for validation + batch); hand-rolled NIfTI I/O
-  <tool>-wasm/     wasm-bindgen bindings only (thin) — exposes core to JS
+  <tool>-core/     pure Rust, no wasm/web deps: ALL the maths, unit-tested
+    src/{model,correct,interp,filt,mask,resample,pipeline,dicom,denoise,b1fill,...}.rs
+  <tool>-cli/      native CLI over the core (validation + batch); hand-rolled NIfTI I/O
+  <tool>-wasm/     wasm-bindgen bindings only (thin); exposes core to JS
 web/
-  index.html       dark theme, drag-drop, role table, params, viewer, downloads
-  js/app.js        controller; js/worker.js  Web Worker; js/nifti.js; js/zip.js
+  index.html       dark theme, mode toggle, drag-drop, role table, params, viewer, downloads
+  js/app.js        controller; js/worker.js Web Worker; js/nifti.js; js/zip.js; js/bids.js
   wasm/            GENERATED by wasm-pack (gitignored)
-tools/
-  gen_golden.py    runs the reference, writes tools/golden/*.npy checkpoints
-  build_wasm.sh    wasm-pack build --target web -> copy pkg -> web/wasm/
-mp2rage_t1/ (or <pkg>/)   the reference Python package + CLI (kept for parity)
+tools/  gen_golden.py (reference -> golden/*.npy);  build_wasm.sh
+<pkg>/  the reference Python package + CLI (kept for parity)
 ```
 
-Core is `no_std`-friendly in spirit: no I/O, no wasm, just `ndarray` + math, so the
-**same code** runs natively (fast tests) and in WASM. Keep `pipeline.rs` in the core
-so the CLI and WASM share one code path.
+The core is I/O-free and wasm-free: pure `ndarray` + math, so the SAME code runs
+natively (fast tests) and in WASM. Keep `pipeline.rs` (the end-to-end assembly) in
+the core so the CLI and WASM share one code path.
 
-## 2. Bit-exact parity is the whole game — the gotchas
+## 3. Bit-exact parity is the whole game
 
-Port numerically, then prove it with golden files. `tools/gen_golden.py` runs the
-reference on a small synthetic phantom and saves intermediate arrays; Rust tests
-reload them and assert closeness. These are the traps that cost the most time:
+Port numerically, then prove it. `tools/gen_golden.py` runs the reference on a small
+synthetic phantom and saves intermediate arrays; Rust parity tests reload them and
+assert closeness. Common traps:
 
-- **`np.arange` uses fused-multiply-add fill**, not `start + i*step`. Reproduce with
-  `(i as f64).mul_add(delta, start)` where `delta = (start+step) - start`. Getting
-  this wrong shifts every lookup-table row and silently corrupts results.
-- **Rounding is banker's rounding** (round-half-**even**) in numpy/`.round()`. Write
-  a `round_half_even`; don't use Rust's `f64::round` (half-away-from-zero).
-- **`np.percentile` default is 'linear'** interpolation: `rank = q/100*(n-1)`, lerp
-  between floor/ceil. Match exactly.
-- **`scipy.ndimage.gaussian_filter`**: `mode='reflect'`, `truncate=4.0`; accumulate
-  in f64 but the Python path may store f32 between axes — mirror its dtype path.
-- **Array layout**: on-disk NIfTI is **i-fastest** `i + nx*(j + ny*k)`; numpy C-order
-  is `i*ny*nz + j*nz + k`. Pick one convention at the WASM boundary and convert
-  explicitly (`arr3` / `flat_ifast` helpers). Layout bugs look like transposed/rolled
-  volumes.
-- **NaN-safe comparisons**: `partial_cmp().unwrap()` panics on NaN → in WASM that's an
-  ugly abort. Use `total_cmp` for sorts; guard interpolators against NaN queries.
-  For NaN-free inputs `total_cmp` sorts identically, so golden parity is preserved.
-- **Interpolators**: PCHIP (Fritsch–Carlson), `RegularGridInterpolator` linear with
-  `bounds_error=False, fill_value=...`, `np.interp` — port each faithfully incl. the
-  out-of-range fill behaviour.
+- **`np.arange` uses a fused-multiply-add fill**, not `start + i*step`. Reproduce with
+  `(i as f64).mul_add(delta, start)` where `delta = (start+step) - start`. Wrong here
+  shifts every lookup-table row and silently corrupts results.
+- **Rounding is banker's (round-half-even)** in numpy/`.round()`. Write `round_half_even`;
+  do not use Rust `f64::round` (half-away-from-zero).
+- **`np.percentile` default is 'linear'**: `rank = q/100*(n-1)`, lerp floor/ceil.
+- **`scipy.ndimage.gaussian_filter`**: `mode='reflect'`, `truncate=4.0`; accumulate in
+  f64 but mirror the Python dtype path (it may store f32 between axes).
+- **Array layout**: on-disk NIfTI is i-fastest `i + nx*(j + ny*k)`; numpy C-order is
+  `i*ny*nz + j*nz + k`. Convert explicitly at the WASM boundary (`arr3` / `flat_ifast`).
+  Layout bugs look like transposed/rolled volumes.
+- **NaN-safe compares**: `partial_cmp().unwrap()` panics on NaN, which in WASM is an ugly
+  abort. Use `total_cmp` for sorts; guard interpolators against NaN queries. NaN-free
+  inputs sort identically, so golden parity holds.
+- **Clamp/lookup consistency**: a fill/clamp range must sit INSIDE the correction
+  lookup's valid domain, or one saturation direction gets zeroed (NaN->sentinel) while
+  the other returns a wrong value.
 
-Validate at three levels: (1) core unit/parity tests (`cargo test`), (2) native CLI
-reproduces the reference on real data (max|diff| ≈ 0), (3) a headless Node e2e that
-drives `nifti.js -> WASM -> nifti.js` and checks against the golden (expect ~1e-4 due
-to f32 storage). Keep clamps/lookup ranges consistent (e.g. a fill clamp must sit
-inside the correction lookup's valid domain, or one saturation direction gets zeroed
-while the other returns a wrong value).
+Validate at three levels: (1) `cargo test` parity, (2) native CLI reproduces the
+reference on real data (max|diff| ~ 0), (3) headless Node e2e driving
+`nifti.js -> WASM -> nifti.js` vs the golden (expect ~1e-4 from f32 storage).
 
-## 3. DICOM & NIfTI in the browser
+## 4. DICOM & NIfTI in the browser
 
-Parse everything client-side; there is no server.
+- **NIfTI**: hand-roll a small NIfTI-1 reader/writer in Rust (CLI) and JS (`nifti.js`),
+  mirrored field-for-field (sform/qform, datatype, scl_slope/inter, `vox_offset`).
+  Writer gotcha: allocate a 352-byte header and do NOT append pad bytes, or vox_offset
+  will not match the data start. Reader safety: size the allocation from the actual
+  file byte length, never from header dims alone (a header claiming huge dims must not
+  OOM the tab); do not use `| 0` on vox_offset (ToInt32 wraps large offsets).
+- **DICOM**: Explicit VR Little Endian covers Siemens. Read `ImageType (0008,0008)`,
+  `SeriesDescription`, geometry (IPP/IOP/PixelSpacing), and Siemens CSA/ASCCONV
+  (`MrPhoenixProtocol`) for sequence params. Assemble by projecting IPP on the slice
+  normal; build an RAS affine (negate x,y from LPS). Harden every slice
+  (`pos+len <= bytes.len()`), long-VR length reads, and undefined-length walks
+  (`saturating_add`). A malformed file returns a clean error, never panics.
+- **Derived output DICOM**: clone source slices, swap in freshly computed pixels and a
+  few tags (`DERIVED\SECONDARY`, new SOP/Series UIDs, RescaleType, bits), keep geometry.
+  Validate with pydicom (geometry preserved, pixels are the computed map).
+- **De-identify (offer it as an opt-in): use a fail-safe whitelist, not a blacklist.**
+  Keep only the technical/geometry/rendering/UID tags a viewer needs (the image-pixel
+  group 0x0028 and pixel data 0x7FE0 wholesale, file-meta 0x0002 minus the AE-title
+  tags 0016/0017, and an enumerated set of SOP/geometry/MR-technique tags); drop
+  everything else, so any tag you did not list is removed by omission. Keep the DICOM
+  Type-2 identity tags (PatientName, PatientID, StudyDate/Time, StudyID, ...) present
+  but blanked for conformance. Re-map StudyInstanceUID and FrameOfReferenceUID to
+  salted values to break linkage back to the source study. Only then stamp
+  `PatientIdentityRemoved=YES`, so the flag is truthful. A blacklist that blanks named
+  tags leaks any tag it forgot (InstanceCreationDate, AcquisitionDateTime, physician
+  names, AdditionalPatientHistory, EthnicGroup) while still asserting YES. A metadata
+  scrub cannot remove burned-in pixel PHI, but the derived map's pixels are freshly
+  computed, so that is not a risk for this output. Unit-test the whitelist: feed a slice
+  carrying a spread of PHI tags and assert they are gone, the identity tags are blank,
+  the UIDs are re-mapped, and the technical tags survive.
 
-- **NIfTI**: hand-roll a small NIfTI-1 reader/writer in Rust (CLI) and JS (`nifti.js`).
-  Mirror them field-for-field (sform/qform, datatype, scl_slope/inter, `vox_offset`).
-  Writer gotcha: if you allocate a 352-byte header, don't also append pad bytes, or
-  `vox_offset` won't match the data start.
-- **DICOM**: Explicit VR Little Endian is enough for Siemens. Parse group/element,
-  handle long VRs (OB/OW/SQ/UN/UT...) with the 4-byte length + reserved, skip
-  sequences, read `ImageType (0008,0008)`, `SeriesDescription`, geometry
-  (`ImagePositionPatient`, `ImageOrientationPatient`, `PixelSpacing`), and the Siemens
-  **CSA/ASCCONV** (`MrPhoenixProtocol`) for sequence params. Assemble slices by
-  projecting `IPP` on the slice normal; build an RAS affine (negate x,y from LPS).
-- **Derived output DICOM**: clone source slices, swap pixels + a few tags
-  (`DERIVED\SECONDARY`, new SOP/Series UIDs, `RescaleType`, bits), keep geometry.
-  Validate with `pydicom`: pixels 0-diff, geometry preserved.
-- **De-identification (offer it, default on)**: for the derived series, blank patient
-  identity (name/ID/DOB/sex/age/address), institution/physician/operator, dates/times,
-  accession; **remove every private (odd-group) element** (Siemens CSA carries PHI);
-  stamp `PatientIdentityRemoved=YES` + `DeidentificationMethod`. Verify with pydicom
-  that the tags are gone and geometry/pixels survive.
-- **Sequence-family gotchas** (surface these to the user as warnings): a Siemens tfl
-  B1 map (`TB1TFL`) exports TWO series — an anatomical reference (ImageType `M`) and
-  the actual **flip-angle map** (ImageType token `FLIP ANGLE MAP`, "famp"); only the
-  latter is the B1 map. Flag non-distortion-corrected `_ND` images (ImageType `ND`,
-  no `DIS2D/DIS3D`) vs corrected. Flag duplicate/mis-assigned roles.
-- **Untrusted input = harden the parsers.** Bounds-check every slice
-  (`pos+len <= bytes.len()`), size allocations from header fields against the actual
-  file size (a header claiming huge dims must not OOM the tab), and use
-  `saturating_add` on attacker-controlled offsets. A malformed file must return a
-  clean error, never panic.
+## 5. Web app architecture (the core plumbing)
 
-## 4. Web app architecture
+- **Web Worker runs the WASM off the UI thread.** Transfer COPIES, not source buffers:
+  `postMessage(msg, [transferables])` detaches the source ArrayBuffer, which empties
+  your in-memory inputs and crashes the NEXT run. Slice each input, post the copy, keep
+  originals pristine. Recreate the worker per run for a clean WASM heap; expose a Stop
+  button (`worker.terminate()`); add a `freeWorker()` that terminates the idle worker to
+  release its multi-GB heap between jobs.
+- **Self-contained canvas viewer.** Roll your own ortho slice viewer + histogram (a few
+  hundred lines). Do NOT pull NiiVue/three from a CDN: `esm.sh?bundle` re-imports from
+  the network and breaks the no-external-requests guarantee and CSP.
+- **Dependency-free ZIP** (store-only + CRC32) for "download all"; gzip the NIfTIs.
+- **Ingest**: folder drag-drop via `webkitGetAsEntry()`; capture ALL entries
+  SYNCHRONOUSLY before the first `await` (`dataTransfer.items` empties after the handler
+  returns). Support several folders at once. Keep a `webkitdirectory` picker as fallback;
+  note Chrome's "upload..." prompt is just folder read-access wording, drag-drop avoids it.
 
-- **Web Worker** runs the WASM off the UI thread. **Transfer COPIES, not the source
-  buffers** — `postMessage([...], [transferables])` *detaches* the source
-  ArrayBuffer, which empties your in-memory inputs and crashes the *next* run. Slice
-  each input, post the copy, keep originals pristine. Recreate the worker per run for
-  a clean WASM heap ("clear cache") and to support a Stop button (`worker.terminate()`).
-- **Self-contained viewer**: a plain `<canvas>` ortho slice viewer + histogram. Do NOT
-  pull NiiVue/three from a CDN — `esm.sh?bundle` re-imports from the network and breaks
-  the "no external requests" guarantee. Roll your own (few hundred lines). Make all
-  three planes scrollable (per-plane index + wheel + sliders).
-- **Dependency-free ZIP** (`zip.js`): store-only (no compression) + CRC32 for
-  "download all". gzip the NIfTIs yourself.
-- **Ingest**: folder drag-drop via `webkitGetAsEntry()` — capture ALL entries
-  **synchronously** before the first `await` (`dataTransfer.items` empties after the
-  handler returns). Support dropping several folders at once. Keep a `webkitdirectory`
-  picker as a fallback, but note Chrome's scary "upload…" prompt is just its wording
-  for folder read-access — drag-drop avoids it.
-- **UX**: role auto-detection from headers/names (let the user correct it), a
-  parameter-source selector (JSON sidecars / DICOM headers / manual+presets), tasks,
-  a live log with a verbose toggle, warnings banner, and a Tutorial modal.
+## 6. Input modes: Single vs BIDS (make them mutually exclusive)
 
-## 5. Privacy & safety checklist (this is the selling point — enforce it)
+Provide two distinct input modes behind a toggle at the top of step 1; they must NOT
+bleed into each other (no stray single scan loaded next to a batch):
 
-- **Zero network egress.** Audit: `grep -rniE 'fetch\(|XMLHttpRequest|WebSocket|sendBeacon|FormData'`
-  over `web/` — the only `fetch` allowed is the WASM loader fetching its own `.wasm`
-  (same-origin, relative). No analytics/beacon/CDN. It must work offline after load.
-- **Escape all user-controlled strings** put into `innerHTML` (filenames!). One
-  unescaped `${name}` is stored XSS that can exfiltrate the loaded data. Prefer
-  `textContent`/`createElement`, or an `esc()` helper.
-- **Validate before compute**: dimension match across same-grid inputs, required
-  multi-volume shapes, and finite numeric params — else a clear message, not a WASM
-  panic or a silent all-NaN download.
-- **Revoke `URL.createObjectURL` blobs** each run/reset (they leak tens of MB).
-- **Accessibility**: focusable drop zone (`tabindex`/`role=button`/keydown), ARIA
-  labels on icon-only controls, `<label for>` associations.
-- Consider a CSP `<meta>` (`default-src 'self'; connect-src 'self'; script-src 'self'
-  'wasm-unsafe-eval'; ...`) as defense-in-depth — but browser-test it, since it can
-  white-screen the app if the wasm/worker directives are wrong.
+- A segmented toggle `[Single dataset] [BIDS directory]` sets `appMode` ('single'|'bids').
+- `setAppMode(mode)`: refuse to switch while `running` (log and return); if leaving BIDS,
+  call `closeBids()`; then clear everything (state.files/jsons, outputs, viewer, downloads,
+  warnings), `freeWorker()`, set `appMode`, and toggle control visibility.
+- `applyModeVisibility()`: in BIDS mode hide the drop zone and the DICOM-folder row and
+  show the BIDS button; in single mode the reverse. Call it once at init.
+- Guard the single load paths: `addFiles`/`addDicomFolder` early-return in BIDS mode.
+- `resetAll()` must also set `appMode='single'` + `applyModeVisibility()` (otherwise it
+  leaves you stranded in BIDS mode with the panel gone).
 
-## 6. Build & deploy
+## 7. BIDS batch mode (the largest piece)
 
-- `tools/build_wasm.sh`: `wasm-pack build --target web` the wasm crate → copy `pkg/`
-  → `web/wasm/`. Parameterize the wasm-pack path (`WASM_PACK=...`) so CI can override.
-- **GitHub Pages via Actions**: single-threaded + SIMD means **no COOP/COEP headers
-  needed** (no SharedArrayBuffer) → plain Pages works. Build job installs Rust +
-  `wasm-pack` (taiki-e/install-action), runs the build script, uploads `web/` as the
-  Pages artifact; deploy job publishes. Use **relative asset paths** so the
-  `/<repo>/` project-site base path works. One-time: repo Settings → Pages → Source =
-  "GitHub Actions".
-- **CI**: `cargo test` + a `wasm32-unknown-unknown` build check + the Node e2e.
-- **NeuroDesk listing**: once the Pages site is live, open an issue/PR on the
-  NeuroDesk web repo for a `*.neurodesk.org` subdomain + applications-page entry; they
-  set the DNS CNAME, then add `web/CNAME` and enable Enforce HTTPS.
+A `web/js/bids.js` indexer (pure, no DOM, testable in Node) plus a BIDS panel in
+app.js. Design goal: load the whole tree, run subjects one at a time, keep only ONE
+session in memory. Copy `web/js/bids.js` and the BIDS section of app.js as the base.
 
-## 7. Data hygiene
+**Indexer (`bids.js`)**: `parseEntities(path)` -> {sub, ses, datatype, suffix, ext, base,
+entities{acq,run,inv,...}}. `indexBids(entries[{path,file}])` -> subjects[].sessions[]
+each with `roles{UNI,INV1,INV2,B1SOURCE}`, `b1kind` ('sa2rage'|'b1map'), `candidates`,
+`files`, `sidecars`, `status{state,reason}`, `runnable{t1,denoise,b1only}`, `warnings`.
+Match rules (MP2RAGE): INV1/INV2 = anat MP2RAGE inv-1/2; UNI = anat UNIT1 (or T1w with a
+uni/uniden/mp2rage acq, flagged nonstandard); B1SOURCE = fmap TB1SRGE (sa2rage) /
+TB1TFL-famp / TB1map / RB1COR (b1map); a TB1TFL "anat" export is NEVER the B1 source.
+`runnable.b1only = UNI && INV2 && B1SOURCE && b1kind==='sa2rage'`. Ship a Node test
+(`web/test/bids_test.mjs`) with synthetic paths mirroring the real dataset.
 
-Gitignore aggressively and verify nothing committable slips in:
-`/data/`, `derivatives/`, `*.nii`, `*.nii.gz`, `*.dcm`, `*.IMA`, dcm2niix `*.json`
-sidecars (BIDS names too), `*.bval/*.bvec`, plus negations to allow committed assets
-(`!web/assets/…`, `!tools/phantom/…`). Keep real data **outside** the repo. Watch for
-PHI in filenames and in the on-screen log.
+**Per-session UI:**
+- Clickable role chips (UNI/INV1/INV2/B1 source). Clicking a chip does TWO things:
+  preview that image in the docked right viewer AND set it as the active role for a
+  single "Reassign <role>:" dropdown that follows the clicked chip, so any role can be
+  reassigned, not just ambiguous ones.
+- A per-session Task selector listing only the runnable tasks (Make T1 map /
+  SA2RAGE -> B1 map / Denoise UNI -> UNI-DEN); it drives the Calculate button label and
+  the output name.
+- Buttons in this order: `load & edit`, then `Calculate`.
+- One-click Calculate: load the session, run it. `load & edit` loads without running so
+  params can be tweaked, and it must NOT scroll the page (the viewer is on the right).
 
-## 8. Verify with an adversarial multi-agent review (optional but high-value)
+**Six state-machine gotchas that will bite (fix them up front):**
+1. **rerender no-op.** `renderBidsSession(ses)` reassigns `ses._el = box` internally, so
+   capture the old node BEFORE rendering: `const old = ses._el; const fresh =
+   renderBidsSession(ses); if (old && old.parentNode) old.parentNode.replaceChild(fresh, old);`
+   Otherwise every reassign silently does nothing on screen.
+2. **Parameter leak between sessions.** In `loadBidsEntry`, RESET the parameter form to a
+   field-appropriate preset (read MagneticFieldStrength from a sidecar, applyPreset 3T/7T)
+   BEFORE applying that session's sidecars. Otherwise a session with no/partial sidecars
+   silently reuses the previous session's TR/TI/flip and produces a wrong T1. Coerce the
+   field strength with `parseFloat` first (sidecars sometimes store it as a string).
+3. **Stale status after reassign.** On reassign, refresh ONLY the reassigned role's status,
+   and derive its ok/warn state from an actual filename/modality check rather than a
+   hard-coded ok, so a mismatched hand-pick is flagged. Leave the other roles' status
+   intact. Do NOT wipe the index-time warnings (they may flag a real problem with a role
+   the user did not touch); keep them and mark them possibly-stale instead. If the session
+   already has a computed result, save/free its download blob before demoting it to
+   'pending', or the blob leaks and its download button disappears with no prompt.
+4. **Async re-entrancy.** Guard `loadBidsEntry`/`calculateBidsEntry` with a `bidsLoading`
+   flag (set before the first await, clear in `finally`). Two fast Calculate clicks (or a
+   double-click) otherwise interleave on the shared `state.files` and mislabel outputs /
+   strand a row in 'running'.
+5. **Stop mid-run leaves a stuck row.** `stopProcessing` must reset a BIDS row that is
+   'running' back to 'loaded' and re-render its actions.
+6. **Worker error path.** The `onResult` error branch must call `updateBidsActions` (not
+   just the status text), or the row stays on "processing..." with no retry button.
 
-For a serious pass, fan out parallel reviewers by lens (usability, functionality,
-I/O byte-correctness, PHI-in-outputs, untrusted-parse panics, numeric/physics
-correctness, docs/consistency), then **adversarially verify each finding** (confirm
-with a concrete trigger, or refute) before acting. Fix the clear wins (security,
-input validation, parse hardening, leaks, a11y); surface design calls (defaults,
-transparency of estimated/extrapolated regions) for the human to decide. Parallelize
-work only across disjoint files (e.g. Python package vs Rust crates vs web JS) to
+**Lean memory:** only one session in memory. Loading/calculating another frees the
+previous entirely (clearOutputs, state.files=[], revoke its download blob, `freeWorker()`
+to drop the WASM heap). `Calculate next` walks the batch.
+
+**Cross-session preview.** Clicking a role chip on a session that is not the current one
+reads that file on demand and previews it. Do NOT append the current session's result
+views to that preview's view selector, or it offers another subject's outputs under the
+previewed subject's chips.
+
+## 8. Permanent docked viewer (QSMbly-style, on the RIGHT)
+
+Dock the viewer permanently on the right in BIDS mode so stepping through subjects never
+scrolls the page up and down.
+
+- Wrap the tree in a 2-column grid `#bidsCols { grid-template-columns: 1fr }`, add a
+  `.with-viewer` class that switches to `minmax(0,1fr) minmax(360px,48%)`; the right
+  slot is `position: sticky; top: 12px`. Stack on narrow screens with a media query.
+- Physically MOVE the existing `#viewerWrap` node into the right slot when entering BIDS
+  mode (capture its home parent/nextSibling so you can move it back), and reset it to its
+  full-width home in single mode. Canvas state survives the DOM move.
+- Fit the viewer to the narrow column: `#viewerWrap.docked #sliders { flex-direction:
+  column }` (the A/C/S sliders otherwise overflow), smaller slice canvases, and REDRAW
+  the histogram + slices on `window.resize` (debounced) so the histogram re-fits.
+- Clicking any input (role chip or the file table's eye icon) previews on the right; do
+  not `scrollIntoView` in BIDS mode. On load, auto-preview the UNI so the right panel is
+  never empty. Show a placeholder ("Load or calculate a session...") when nothing is up.
+
+## 9. Download and memory flow (review first, then prompt)
+
+Flow: show the result BEFORE anything downloads, then prompt to save it before it is
+freed.
+
+- **Auto-download OFF by default.** On completion, build the result blob + a prominent
+  per-session "Download <file>" link and show the result. Do not auto-download unless the
+  auto-download box is ticked.
+- Track `ses._downloaded` (set true on auto-download, on clicking the row link, on
+  Download-and-unload, and on clicking a viewer download link that carries the result).
+  If saving via the docked viewer's own download links does not set it, the eviction
+  prompt fires falsely for a result the user already saved.
+- **Eviction prompt.** When loading the next session evicts a done, un-downloaded result,
+  `confirm("The result for X has not been downloaded and will be freed... Download now?")`
+  and download on OK. This is the memory-constraint safety net.
+- **Defer the blob-URL revoke.** After a click()-triggered download, revoke the object URL
+  on a later tick (`setTimeout(revoke, ~4000)`), not synchronously in the same tick.
+  Revoking immediately can abort a still-queued download (Firefox/Safari, multi-MB files)
+  and silently lose the file.
+- Blob-URL lifecycle: keep at most ONE live result blob (the current done session's);
+  revoke on eviction, on Download-and-unload, on recompute, and in `closeBids`. Do not
+  push these into the generic `objectUrls` list that gets revoked every run.
+
+## 10. Threading a new option through the whole stack (fast recipe)
+
+Every optional flag (extend-B1-FOV, de-identify, fallback-uncorrected, denoise beta)
+follows the same path. Do it as one mechanical pass:
+
+1. Core: add a trailing param to the pipeline fn (`run_b1map(..., extend_fov, fallback)`).
+2. WASM: add the same trailing param to the `#[wasm_bindgen]` fn; forward it.
+3. Worker: pass `!!msg.flag` in the wasm call.
+4. run(): set `msg.flag = $('#control').checked`.
+5. UI: a checkbox in the run controls, plus a PER-SESSION control in each BIDS row. Make
+   the per-session controls task-contextual: show extend-FOV and fill-non-converged for
+   the T1 task, a denoise-beta input for the denoise task. A BIDS toolbar holds batch
+   DEFAULTS that seed each pending session (`reseedBidsDefaults` on a toolbar change);
+   `loadBidsEntry` pushes the session's own values into the run controls
+   (`applyBidsSessionOptions`) before Calculate. The controls belong per-session, not
+   only batch-wide.
+6. Update ALL callers so it compiles, including tests: pass the default (usually `false`)
+   so golden parity holds. Rebuild the wasm.
+
+**Parallelize with background agents on disjoint files.** The Rust threading (crates/) is
+independent of the web JS (web/) and the reference Python. Spawn a background agent for
+the Rust part while doing the JS/HTML, then integrate + rebuild. Specify the exact final
+signatures so the JS matches.
+
+## 11. Domain knowledge and sanity checks (MP2RAGE-specific)
+
+This section is domain-specific, not general, but it illustrates the kind of sanity
+checks worth adding for any modality.
+
+- **CSF/ventricle holes are expected, not a bug and not a UNI-DEN artifact.** The MP2RAGE
+  UNI->T1 lookup can only invert a limited T1 range; very long-T1 fluid (CSF, eyeball
+  vitreous, ~4 s) falls off the invertible part, gets a sentinel (`t=4.0` -> 4000 ms) and
+  is zeroed. It happens with the plain UNI too. UNI-DEN separately punches holes in
+  low-SNR regions, which is why plain UNI is preferred as the correction input.
+- **fallback_uncorrected** fills non-converged in-mask voxels with the uncorrected T1.
+  It recovers roughly half the holes (the CSF voxels that have a valid uncorrected value,
+  ~4500 ms); the rest are genuinely ambiguous (zero in the uncorrected map too). Expose it
+  as an option; state that it does not recover everything.
+- **A "B1 map" file may not be a B1 field.** A Siemens `B1_Head_3d` / `TB1map` can be the
+  MAGNITUDE anatomical reference (ImageType has `M/MAGNITUDE`, values not near nominal,
+  shows brain anatomy), not the flip-angle field. Feeding it as B1 produces garbage. Add a
+  post-run sanity check on the relative B1: the in-brain median is the reliable tell.
+  Warn if the median is outside [0.5, 1.7], or the spread `(p90-p10)/median > 1.0` while
+  the median is also off (below 0.75 or above 1.3). Do not warn on spread alone: a real 7T
+  field with cerebellar/temporal drop-out can reach spread ~0.9 at a median near 1. Make
+  the message task-aware (a B1-only run has no uncorrected T1 to fall back to).
+- **TB1map units are ambiguous** across sequences (percent vs flip x10 vs relative). Expose
+  the type; the sanity check catches a wrong choice.
+- **Messy real BIDS**: a session can carry several `UNIT1`-tagged files that are actually
+  MPR reformats (SECONDARY, different grid) and single-slice projection thumbnails. Pick
+  the PRIMARY full-3D one; the dimension check (UNI vs INV2 grid) catches a wrong pick.
+
+## 12. Privacy, safety, analytics
+
+- **Zero data egress.** Audit `grep -rniE 'fetch\(|XMLHttpRequest|WebSocket|sendBeacon|FormData'`
+  over web/. The only intended external request is analytics (below); the wasm `fetch` is
+  its own same-origin `.wasm`. Images/results never leave.
+- **Escape every user-controlled string** put into innerHTML (filenames, chip text,
+  warnings, download names, sidecar-derived table rows). One unescaped `${name}` is stored
+  XSS that can exfiltrate the loaded volumes. Prefer textContent/createElement or an
+  `esc()` helper, and check EVERY new `innerHTML` sink.
+- **Validate before compute**: matching dims across same-grid inputs, required multi-volume
+  shapes (SA2RAGE = 2 vols), finite numeric params. A clear message beats a WASM panic or a
+  silent all-NaN download.
+- **Analytics (NeuroDesk asks for GA4).** Add the standard gtag snippet, then rescope ALL
+  the "nothing leaves" copy to "your images never leave your browser" and disclose the
+  anonymous page-view analytics honestly (badge, About/Privacy, tutorial, README, drop-zone
+  tooltip, footer, startup log, code comments). GA changes the "no external requests /
+  works fully offline" story but NOT the "your images never leave" story. Give an off-switch
+  (delete the script) in the README/DEPLOY. GA4 is the only external runtime dependency and
+  the only thing that makes any network request; it has no SRI and a static Pages deploy has
+  no CSP, so it is the one supply-chain surface to keep in mind.
+
+## 13. Build & deploy
+
+- `tools/build_wasm.sh`: `wasm-pack build --target web` -> copy pkg -> `web/wasm/`.
+  Parameterize `WASM_PACK=...` so CI can override. `web/wasm/` is gitignored, so it must be
+  rebuilt and re-staged after ANY Rust change, or the deployed app runs stale code.
+- **GitHub Pages via Actions**: single-threaded + SIMD means no COOP/COEP headers needed.
+  Build job installs Rust + wasm-pack (taiki-e/install-action), runs the script, uploads
+  `web/`; deploy job publishes. Relative asset paths so it works at both `/<repo>/` and a
+  custom domain root. One-time: Settings -> Pages -> Source = GitHub Actions.
+- **NeuroDesk custom domain**: they give you `<name>.neurodesk.org` and set the DNS. Add
+  `web/CNAME` with the domain, set it in Settings -> Pages, tick Enforce HTTPS. CI runs
+  cargo test + a wasm32 build check + the Node e2e.
+
+## 14. Data hygiene
+
+Gitignore aggressively: `/data/`, `derivatives/`, `*.nii`, `*.nii.gz`, `*.dcm`, `*.IMA`,
+dcm2niix `*.json` sidecars (BIDS-named too), `*.bval/*.bvec`, plus negations for committed
+assets (`!web/assets/...`, `!tools/phantom/...`). Keep real data OUTSIDE the repo. Watch
+for PHI in filenames and in the on-screen log.
+
+## 15. Verification discipline
+
+After each substantial change, run an adversarial multi-agent review: fan out parallel
+reviewers by lens (security, speed/efficiency, runtime/robustness, Rust correctness,
+usability, PHI-in-outputs, parity), then adversarially VERIFY each material finding
+(confirm with a concrete trigger, or refute) before acting. Do not skip the verify pass;
+it removes hallucinated findings and calibrates severity.
+
+Bug classes this review discipline surfaces in a codebase like this (look for them
+proactively):
+- DOM rerender no-ops (reassigning `ses._el` before `replaceChild`).
+- State leaking between items in a batch (parameter form not reset per session).
+- Blob-URL accumulation, use-after-revoke, and synchronous revoke aborting a download.
+- Async re-entrancy on shared state (double-click during file read).
+- Unescaped innerHTML with a filename or sidecar value.
+- Clamp/lookup-range mismatch producing a silently-wrong value on one side.
+- Worker heap not freed between jobs (multi-GB idle).
+- Allow-list vs blacklist for de-identification: a blacklist leaks any tag it forgot.
+
+Fix the clear wins directly (security, validation, parse hardening, leaks, a11y); surface
+the design calls (defaults, transparency of extrapolated/filled regions) for the human.
+Parallelize implementation only across disjoint files (Rust crates vs web JS vs Python) to
 avoid edit conflicts.
 
 ## Reusable scaffolding (copy these from this repo)
 
-This skill lives inside the reference implementation, so don't rewrite the plumbing —
-copy it. ~80% of a new tool is domain-agnostic; only the maths and the UI specifics
-change. Copy-and-adapt:
+About 80% of a new tool is domain-agnostic; only the maths and the UI task set change.
+- `web/js/nifti.js`, `web/js/zip.js` (reuse as-is), `web/js/worker.js` (copy-transfer).
+- `web/js/bids.js` (the BIDS indexer) and the BIDS section of `web/js/app.js` (the whole
+  panel + docked viewer + reassign + task selector + download flow); rewire the roles/tasks.
+- `web/js/app.js` canvas viewer, histogram, guided tour, drag-drop ingest, warnings,
+  download builder, mode toggle.
+- `crates/<tool>-core/src/{dicom,interp,filt,mask,resample,b1fill}.rs` and `nifti_io.rs`;
+  `crates/<tool>-wasm/src/lib.rs` (arr3/flat_ifast boundary).
+- `tools/gen_golden.py`, `tools/build_wasm.sh`, `.github/workflows/*`.
 
-- `web/js/nifti.js` — NIfTI-1 read/write (gzip) in JS. Reuse as-is.
-- `web/js/zip.js` — dependency-free store-only ZIP + CRC32. Reuse as-is.
-- `web/js/worker.js` — Web Worker pattern (copy-transfer discipline). Change the calls.
-- `web/js/app.js` — extract the canvas ortho viewer, histogram, guided tour, drag-drop
-  ingest, warnings, and download builder; rewire the task/params to the new tool.
-- `crates/mp2rage-core/src/dicom.rs` — DICOM parse + assemble + derived-series writer +
-  de-identify. Reuse; adjust `classify()` and any tool-specific tags.
-- `crates/mp2rage-cli/src/nifti_io.rs` — Rust NIfTI read/write. Reuse as-is.
-- `crates/mp2rage-core/src/{interp,filt,mask,resample}.rs` — the numeric building blocks
-  (arange/mul_add, PCHIP, np_interp, gaussian, percentile, affine resample). Mostly reuse.
-- `crates/mp2rage-wasm/src/lib.rs` — the wasm-bindgen boundary pattern (arr3/flat_ifast).
-- `tools/gen_golden.py`, `tools/build_wasm.sh`, `.github/workflows/{deploy-pages,ci}.yml` —
-  golden harness, wasm build, deploy/CI. Reuse; point at the new reference + crates.
-
-What you actually rewrite per tool: the algorithm modules (`model.rs`, `correct.rs`,
-`denoise.rs`, `pipeline.rs`), the reference Python it's ported from, and the UI's
-task/parameter set.
-
-Honest scope: this is a **playbook + scaffold pointer**, not a fill-in template. It
-keeps a rebuild on the rails and — most valuably — saves you from re-discovering the
-parity gotchas (§2) and privacy/safety traps (§5), which is where the real time goes.
-For a brand-new modality you still supply the maths and validate it against a reference;
-the skill makes everything around that maths near-mechanical.
+Rewrite the algorithm modules (`model.rs`, `correct.rs`, `denoise.rs`, `pipeline.rs`), the
+reference Python, and the task/parameter set.
 
 ## Quick start checklist
 
 1. Vendor the reference; write `tools/gen_golden.py` (phantom + checkpoints).
-2. Port core module-by-module; add parity tests until `cargo test` is green.
-3. Native CLI reproduces the reference on real data (max|diff| ≈ 0).
+2. Port the core module-by-module; parity tests until `cargo test` is green.
+3. Native CLI reproduces the reference on real data (max|diff| ~ 0).
 4. wasm crate + `build_wasm.sh`; Node e2e reproduces the golden (~1e-4).
-5. Web app: worker (copy-transfer!), self-contained viewer, ingest, downloads.
-6. Privacy audit + input validation + parser hardening + de-identify option.
-7. Pages deploy workflow + CI; gitignore data; write the README (web app first).
+5. Web app single mode: worker (copy-transfer!), self-contained viewer, ingest, downloads.
+6. Add the Single/BIDS toggle, then BIDS mode (indexer + panel + docked viewer + review-
+   first download), watching the six state-machine gotchas in section 7.
+7. Thread the optional flags (section 10); add the sanity checks (section 11).
+8. Privacy audit + validation + parser hardening + whitelist de-identify; scope copy for
+   analytics.
+9. Pages deploy + CI; gitignore data; barebones README (site first); no em dashes.
+10. Adversarial review pass; fix confirmed findings; hand the user a commit message.

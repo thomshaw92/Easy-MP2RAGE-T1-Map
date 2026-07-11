@@ -101,7 +101,9 @@ pub fn parse(bytes: &[u8]) -> Result<DicomFile, String> {
         let (g, e, vr, len) = match read_elem(bytes, &mut pos, false) { Some(x) => x, None => break };
         if g != 0x0002 { pos = save; break; } // meta group done
         if len == 0xFFFF_FFFF { return Err("undefined-length in meta".into()); }
-        if pos + len > bytes.len() { return Err("truncated DICOM meta element".into()); }
+        // subtract, do not add: `pos + len` wraps on wasm32 (32-bit usize) for a
+        // hostile length near u32::MAX and would bypass this guard.
+        if len > bytes.len().saturating_sub(pos) { return Err("truncated DICOM meta element".into()); }
         if g == 0x0002 && e == 0x0010 {
             let uid = ascii(&bytes[pos..pos + len]);
             if uid == "1.2.840.10008.1.2" { implicit = true; }
@@ -129,7 +131,7 @@ pub fn parse(bytes: &[u8]) -> Result<DicomFile, String> {
             } else { pos += len; }
             continue;
         }
-        if pos + len > bytes.len() { break; }
+        if len > bytes.len().saturating_sub(pos) { break; } // subtract: pos+len wraps on wasm32
         let v = &bytes[pos..pos + len];
         match (g, e) {
             (0x0008, 0x0008) => df.image_type = ascii(v).split('\\').map(|s| s.trim().to_string()).collect(),
@@ -335,7 +337,7 @@ fn parse_all(bytes: &[u8]) -> Result<Vec<Elem>, String> {
             } else { pos += len; }
             continue;
         }
-        if pos + len > bytes.len() { break; }
+        if len > bytes.len().saturating_sub(pos) { break; } // subtract: pos+len wraps on wasm32
         out.push(Elem { group, elem, vr, data: bytes[pos..pos + len].to_vec() });
         pos += len;
     }
@@ -359,55 +361,102 @@ fn get_elem<'a>(elems: &'a [Elem], group: u16, elem: u16) -> Option<&'a [u8]> {
     elems.iter().find(|e| e.group == group && e.elem == elem).map(|e| e.data.as_slice())
 }
 /// Strip patient/identifying tags from a single slice's elements in place.
-/// Blanks known identifying tags, drops every private (odd-group) element, and
-/// stamps the PS3.15 de-identification flags. Geometry, pixel data, and the
-/// UIDs that link the object to its study are left untouched.
-fn deidentify_elems(elems: &mut Vec<Elem>) {
-    // Blank known identifying tags to an empty value (VR kept meaningful).
+///
+/// This is a fail-safe *whitelist*: every element that is not an enumerated
+/// technical/geometry/rendering/UID tag, a blanked Type-2 identity tag, an
+/// enumerated image-pixel tag (group 0x0028), an enumerated file-meta tag (group
+/// 0x0002), or the pixel data (0x7FE0) is dropped. The whitelist is applied even
+/// inside groups 0x0002 and 0x0028 (no wholesale group keeps), because both carry
+/// identity-bearing members: 0x0002 has PrivateInformation (0002,0102) and its
+/// creator UID (0002,0100), and 0x0028 has free-text comments (0028,4000).
+/// Anything the source carries that we did not enumerate is removed by omission,
+/// so no un-listed source PHI (dates, physicians, patient history, private/CSA
+/// text) can survive. The UIDs that would otherwise link the object back to the
+/// source study / frame of reference are re-mapped from `salt`. Only then is
+/// PatientIdentityRemoved=YES stamped, so the flag is accurate.
+fn deidentify_elems(elems: &mut Vec<Elem>, salt: &str) {
+    // Type-2 identity tags: DICOM requires them present, but they may be empty.
+    // Keep present-but-blank so the object stays conformant for PACS that index
+    // on them, while carrying no value.
     let blanks: &[(u16, u16, &[u8; 2])] = &[
-        // Patient identity
         (0x0010, 0x0010, b"PN"), // PatientName
         (0x0010, 0x0020, b"LO"), // PatientID
-        (0x0010, 0x0030, b"DA"), // PatientBirthDate
-        (0x0010, 0x0040, b"CS"), // PatientSex
-        (0x0010, 0x1010, b"AS"), // PatientAge
-        (0x0010, 0x1040, b"LO"), // PatientAddress
-        (0x0010, 0x1000, b"LO"), // OtherPatientIDs
-        (0x0010, 0x1001, b"PN"), // OtherPatientNames
-        (0x0010, 0x1005, b"PN"), // PatientBirthName
-        (0x0010, 0x1060, b"PN"), // PatientMotherBirthName
-        (0x0010, 0x2154, b"SH"), // PatientTelephoneNumbers
-        (0x0010, 0x4000, b"LT"), // PatientComments
-        // Institution / physicians / operators
-        (0x0008, 0x0080, b"LO"), // InstitutionName
-        (0x0008, 0x0081, b"ST"), // InstitutionAddress
-        (0x0008, 0x0090, b"PN"), // ReferringPhysicianName
-        (0x0008, 0x1010, b"SH"), // StationName
-        (0x0008, 0x1040, b"LO"), // InstitutionalDepartmentName
-        (0x0008, 0x1050, b"PN"), // PerformingPhysicianName
-        (0x0008, 0x1060, b"PN"), // NameOfPhysiciansReadingStudy
-        (0x0008, 0x1070, b"PN"), // OperatorsName
-        (0x0032, 0x1032, b"PN"), // RequestingPhysician
-        // Dates / times / accession
         (0x0008, 0x0020, b"DA"), // StudyDate
-        (0x0008, 0x0021, b"DA"), // SeriesDate
-        (0x0008, 0x0022, b"DA"), // AcquisitionDate
-        (0x0008, 0x0023, b"DA"), // ContentDate
         (0x0008, 0x0030, b"TM"), // StudyTime
-        (0x0008, 0x0031, b"TM"), // SeriesTime
-        (0x0008, 0x0032, b"TM"), // AcquisitionTime
+        (0x0008, 0x0023, b"DA"), // ContentDate
         (0x0008, 0x0033, b"TM"), // ContentTime
         (0x0008, 0x0050, b"SH"), // AccessionNumber
+        (0x0008, 0x0090, b"PN"), // ReferringPhysicianName
+        (0x0020, 0x0010, b"SH"), // StudyID
     ];
+    // Technical / geometry / rendering / UID tags safe to keep verbatim and
+    // needed for a valid, viewable derived MR image.
+    const KEEP: &[(u16, u16)] = &[
+        (0x0008, 0x0005), // SpecificCharacterSet
+        (0x0008, 0x0008), // ImageType
+        (0x0008, 0x0016), // SOPClassUID
+        (0x0008, 0x0018), // SOPInstanceUID
+        (0x0008, 0x0060), // Modality
+        (0x0008, 0x0064), // ConversionType
+        (0x0008, 0x0070), // Manufacturer (vendor, not patient identity)
+        (0x0008, 0x103E), // SeriesDescription (overwritten by caller)
+        (0x0008, 0x1090), // ManufacturerModelName
+        (0x0018, 0x0020), // ScanningSequence
+        (0x0018, 0x0021), // SequenceVariant
+        (0x0018, 0x0023), // MRAcquisitionType
+        (0x0018, 0x0050), // SliceThickness
+        (0x0018, 0x0080), // RepetitionTime
+        (0x0018, 0x0081), // EchoTime
+        (0x0018, 0x0088), // SpacingBetweenSlices
+        (0x0018, 0x1314), // FlipAngle
+        (0x0018, 0x5100), // PatientPosition (orientation, not identity)
+        (0x0020, 0x000D), // StudyInstanceUID (re-mapped below)
+        (0x0020, 0x000E), // SeriesInstanceUID (overwritten by caller)
+        (0x0020, 0x0011), // SeriesNumber
+        (0x0020, 0x0012), // AcquisitionNumber
+        (0x0020, 0x0013), // InstanceNumber
+        (0x0020, 0x0032), // ImagePositionPatient
+        (0x0020, 0x0037), // ImageOrientationPatient
+        (0x0020, 0x0052), // FrameOfReferenceUID (re-mapped below)
+        (0x0020, 0x1041), // SliceLocation
+        (0x0012, 0x0062), // PatientIdentityRemoved (stamped below)
+        (0x0012, 0x0063), // DeidentificationMethod (stamped below)
+    ];
+    // File-meta (0x0002) safe members. NOT kept wholesale: 0002,0100/0102 carry a
+    // private-information blob and its creator UID, and 0002,0016/0017 the AE title.
+    const KEEP_META: &[u16] = &[0x0000, 0x0001, 0x0002, 0x0003, 0x0010, 0x0012, 0x0013];
+    // Image-pixel (0x0028) technical members. NOT kept wholesale: 0028,4000
+    // (Image Presentation Comments) is operator free text; 0028,0301
+    // (BurnedInAnnotation) is set explicitly below rather than inherited.
+    const KEEP_28: &[u16] = &[
+        0x0002, 0x0004, 0x0006, 0x0010, 0x0011, 0x0030,
+        0x0100, 0x0101, 0x0102, 0x0103, 0x0106, 0x0107,
+        0x1050, 0x1051, 0x1052, 0x1053, 0x1054,
+    ];
+    elems.retain(|e| {
+        e.group == 0x7FE0
+            || (e.group == 0x0028 && KEEP_28.contains(&e.elem))
+            || (e.group == 0x0002 && KEEP_META.contains(&e.elem))
+            || KEEP.contains(&(e.group, e.elem))
+            || blanks.iter().any(|&(g, el, _)| g == e.group && el == e.elem)
+    });
     for &(g, e, vr) in blanks {
         set_elem(elems, g, e, vr, Vec::new());
     }
-    // Drop every private-group element (odd group number). This also removes the
-    // Siemens CSA group 0x0029, which can carry protocol/patient text.
-    elems.retain(|e| e.group % 2 == 0);
-    // Stamp the PS3.15 de-identification flags.
+    // The derived pixel data is a freshly computed map with no burned-in text, so
+    // assert BurnedInAnnotation=NO rather than inheriting the source flag.
+    set_elem(elems, 0x0028, 0x0301, b"CS", b"NO".to_vec());
+    // Re-map the UIDs that would otherwise link this object back to the source
+    // study / frame of reference (a re-identification vector). The two-component
+    // ".900.1"/".900.2" tails cannot collide with the single-component per-slice
+    // SOP / series UID tails, whatever the slice count.
+    set_elem(elems, 0x0020, 0x000D, b"UI", format!("1.2.826.0.1.3680043.2.1125.{salt}.900.1").into_bytes());
+    if get_elem(elems, 0x0020, 0x0052).is_some() {
+        set_elem(elems, 0x0020, 0x0052, b"UI", format!("1.2.826.0.1.3680043.2.1125.{salt}.900.2").into_bytes());
+    }
+    // Stamp the PS3.15 de-identification flags (now accurate: nothing un-listed survives).
     set_elem(elems, 0x0012, 0x0062, b"CS", b"YES".to_vec());
-    set_elem(elems, 0x0012, 0x0063, b"LO", b"Easy-MP2RAGE-T1-Map basic tag removal".to_vec());
+    set_elem(elems, 0x0012, 0x0063, b"LO", b"Easy-MP2RAGE-T1-Map whitelist de-identification".to_vec());
 }
 
 fn write_elem(out: &mut Vec<u8>, e: &Elem) {
@@ -458,7 +507,9 @@ pub fn write_derived_series(sources: &[&[u8]], t1: &[f32], nx: usize, ny: usize,
         }
         parsed.push((idx, f.ipp[0] * normal[0] + f.ipp[1] * normal[1] + f.ipp[2] * normal[2]));
     }
-    parsed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    // total_cmp, not partial_cmp().unwrap(): a source slice with a non-finite
+    // ImagePositionPatient would make the projection NaN and panic the unwrap.
+    parsed.sort_by(|a, b| a.1.total_cmp(&b.1));
     if parsed.len() != nz {
         return Err(format!("source slices ({}) != volume slices ({nz})", parsed.len()));
     }
@@ -497,10 +548,94 @@ pub fn write_derived_series(sources: &[&[u8]], t1: &[f32], nx: usize, ny: usize,
             set_elem(&mut elems, 0x0008, 0x0060, b"CS", b"MR".to_vec());
         }
         if deidentify {
-            deidentify_elems(&mut elems);
+            deidentify_elems(&mut elems, salt);
         }
         files.push(serialize(&elems));
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn el(group: u16, elem: u16, vr: &[u8; 2], data: &[u8]) -> Elem {
+        Elem { group, elem, vr: *vr, data: data.to_vec() }
+    }
+    fn has(elems: &[Elem], g: u16, e: u16) -> bool {
+        get_elem(elems, g, e).is_some()
+    }
+
+    #[test]
+    fn deidentify_is_a_fail_safe_whitelist() {
+        // A slice carrying a spread of real-world PHI plus the technical tags a
+        // viewer needs. The whitelist must strip every PHI tag (even ones not
+        // individually enumerated) while keeping the technical/geometry set.
+        let mut elems = vec![
+            // PHI that a blacklist would miss:
+            el(0x0010, 0x21B0, b"LT", b"MRN 12345 John Smith"), // AdditionalPatientHistory
+            el(0x0010, 0x2160, b"SH", b"WHITE"),                // EthnicGroup
+            el(0x0010, 0x0032, b"TM", b"0930"),                 // PatientBirthTime
+            el(0x0010, 0x21C0, b"US", &[0, 0]),                 // PregnancyStatus
+            el(0x0008, 0x1030, b"LO", b"BRAIN w/ contrast"),    // StudyDescription
+            el(0x0008, 0x002A, b"DT", b"20240101093000"),       // AcquisitionDateTime
+            el(0x0008, 0x0012, b"DA", b"20240101"),             // InstanceCreationDate
+            el(0x0008, 0x1048, b"PN", b"Dr^Referrer"),          // PhysiciansOfRecord
+            el(0x0008, 0x009C, b"PN", b"Dr^Consult"),           // ConsultingPhysicianName
+            el(0x0029, 0x1010, b"OB", b"CSA private blob"),     // Siemens private group (odd)
+            el(0x0002, 0x0102, b"OB", b"vendor PHI blob"),      // file-meta PrivateInformation
+            el(0x0002, 0x0100, b"UI", b"1.2.3.4.creator"),      // PrivateInformationCreatorUID
+            el(0x0028, 0x4000, b"LT", b"typed by operator: John Smith"), // Image Presentation Comments
+            // identity that must be present-but-empty:
+            el(0x0010, 0x0010, b"PN", b"Smith^John"),           // PatientName
+            el(0x0010, 0x0020, b"LO", b"PT-0001"),              // PatientID
+            // linkage UIDs that must be re-mapped:
+            el(0x0020, 0x000D, b"UI", b"1.2.3.4.original.study"),
+            el(0x0020, 0x0010, b"SH", b"STUDY-42"),             // StudyID (dropped)
+            el(0x0020, 0x0052, b"UI", b"1.2.3.4.original.for"),
+            el(0x0002, 0x0016, b"AE", b"SCANNER01"),            // SourceApplicationEntityTitle (dropped)
+            // technical / geometry that must survive:
+            el(0x0028, 0x0010, b"US", &16u16.to_le_bytes()),    // Rows
+            el(0x0020, 0x0037, b"DS", b"1\\0\\0\\0\\1\\0"),      // ImageOrientationPatient
+            el(0x0008, 0x0060, b"CS", b"MR"),                   // Modality
+            el(0x7FE0, 0x0010, b"OW", b"\x00\x01\x02\x03"),      // PixelData
+        ];
+        deidentify_elems(&mut elems, "97531");
+
+        // every un-enumerated PHI tag is gone
+        for (g, e) in [
+            (0x0010, 0x21B0), (0x0010, 0x2160), (0x0010, 0x0032), (0x0010, 0x21C0),
+            (0x0008, 0x1030), (0x0008, 0x002A), (0x0008, 0x0012), (0x0008, 0x1048),
+            (0x0008, 0x009C),
+        ] {
+            assert!(!has(&elems, g, e), "PHI tag ({g:04X},{e:04X}) survived de-identification");
+        }
+        // private/odd group and source AE title dropped
+        assert!(!elems.iter().any(|e| e.group % 2 == 1), "a private (odd-group) tag survived");
+        assert!(!has(&elems, 0x0002, 0x0016), "SourceApplicationEntityTitle survived");
+        // file-meta private-info and image-pixel free text dropped (no wholesale group keep)
+        assert!(!has(&elems, 0x0002, 0x0102), "file-meta PrivateInformation survived");
+        assert!(!has(&elems, 0x0002, 0x0100), "PrivateInformationCreatorUID survived");
+        assert!(!has(&elems, 0x0028, 0x4000), "Image Presentation Comments (free text) survived");
+        // BurnedInAnnotation asserted NO (derived pixels are freshly computed)
+        assert_eq!(get_elem(&elems, 0x0028, 0x0301).map(|v| v.trim_ascii_end()), Some(&b"NO"[..]));
+
+        // identity kept present but blank (Type-2 conformance; value removed)
+        assert_eq!(get_elem(&elems, 0x0010, 0x0010), Some(&b""[..]), "PatientName not blanked");
+        assert_eq!(get_elem(&elems, 0x0010, 0x0020), Some(&b""[..]), "PatientID not blanked");
+        assert_eq!(get_elem(&elems, 0x0020, 0x0010), Some(&b""[..]), "StudyID not blanked");
+
+        // linkage UIDs re-mapped away from the source values
+        assert_ne!(get_elem(&elems, 0x0020, 0x000D), Some(&b"1.2.3.4.original.study"[..]));
+        assert_ne!(get_elem(&elems, 0x0020, 0x0052), Some(&b"1.2.3.4.original.for"[..]));
+
+        // technical/geometry/pixel survive
+        for (g, e) in [(0x0028, 0x0010), (0x0020, 0x0037), (0x0008, 0x0060), (0x7FE0, 0x0010)] {
+            assert!(has(&elems, g, e), "technical tag ({g:04X},{e:04X}) was dropped");
+        }
+
+        // the PS3.15 flag is now accurate (CS value is padded to even length)
+        assert_eq!(get_elem(&elems, 0x0012, 0x0062).map(|v| v.trim_ascii_end()), Some(&b"YES"[..]));
+    }
 }
 

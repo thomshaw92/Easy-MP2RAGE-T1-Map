@@ -1,4 +1,4 @@
-//! Minimal NIfTI-1 reader/writer (little-endian) — dependency-light, no
+//! Minimal NIfTI-1 reader/writer (little-endian), dependency-light, no
 //! ndarray-version coupling. Handles .nii and .nii.gz, sform/qform affine,
 //! scl_slope/inter, and the common datatypes for MP2RAGE/SA2RAGE data.
 
@@ -113,50 +113,45 @@ pub fn read_nifti(path: &str) -> Result<NiftiVol, String> {
 
     let n: usize = dims.iter().product();
     let off = vox_offset.max(352);
-    let need_bytes = |bpp: usize| off + n * bpp;
+    // Bytes-per-pixel for the supported datatypes; reject unknown codes before
+    // allocating anything.
+    let bpp: usize = match datatype {
+        16 => 4,  // f32
+        64 => 8,  // f64
+        4 => 2,   // i16
+        512 => 2, // u16
+        8 => 4,   // i32
+        2 => 1,   // u8
+        dt => return Err(format!("{path}: unsupported datatype code {dt}")),
+    };
+    // Validate the declared volume against the ACTUAL file length with checked
+    // arithmetic BEFORE reserving. A header can claim huge dims from a tiny file;
+    // reserving n*8 up front would OOM-abort, and off+n*bpp could overflow. After
+    // this check n is bounded by the real file size, so with_capacity and every
+    // off+k*i read below are in bounds (this also covers the i16/u16/i32/u8 arms
+    // that previously had no truncation guard).
+    let need = n
+        .checked_mul(bpp)
+        .and_then(|b| b.checked_add(off))
+        .ok_or_else(|| format!("{path}: NIfTI dimensions overflow the addressable range"))?;
+    if bytes.len() < need {
+        return Err(format!("{path}: truncated NIfTI data (need {need} bytes, have {})", bytes.len()));
+    }
     let raw = &bytes;
     let mut data = Vec::with_capacity(n);
     match datatype {
-        16 => {
-            if raw.len() < need_bytes(4) {
-                return Err(format!("{path}: truncated f32 data"));
-            }
-            for i in 0..n {
-                data.push(rd_f32(raw, off + 4 * i) as f64);
-            }
-        }
-        64 => {
-            if raw.len() < need_bytes(8) {
-                return Err(format!("{path}: truncated f64 data"));
-            }
-            for i in 0..n {
-                let o = off + 8 * i;
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&raw[o..o + 8]);
-                data.push(f64::from_le_bytes(b));
-            }
-        }
-        4 => {
-            for i in 0..n {
-                data.push(rd_i16(raw, off + 2 * i) as f64);
-            }
-        }
-        512 => {
-            for i in 0..n {
-                data.push(u16::from_le_bytes([raw[off + 2 * i], raw[off + 2 * i + 1]]) as f64);
-            }
-        }
-        8 => {
-            for i in 0..n {
-                data.push(rd_i32(raw, off + 4 * i) as f64);
-            }
-        }
-        2 => {
-            for i in 0..n {
-                data.push(raw[off + i] as f64);
-            }
-        }
-        dt => return Err(format!("{path}: unsupported datatype code {dt}")),
+        16 => for i in 0..n { data.push(rd_f32(raw, off + 4 * i) as f64); },
+        64 => for i in 0..n {
+            let o = off + 8 * i;
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&raw[o..o + 8]);
+            data.push(f64::from_le_bytes(b));
+        },
+        4 => for i in 0..n { data.push(rd_i16(raw, off + 2 * i) as f64); },
+        512 => for i in 0..n { data.push(u16::from_le_bytes([raw[off + 2 * i], raw[off + 2 * i + 1]]) as f64); },
+        8 => for i in 0..n { data.push(rd_i32(raw, off + 4 * i) as f64); },
+        2 => for i in 0..n { data.push(raw[off + i] as f64); },
+        _ => unreachable!("datatype validated above"),
     }
     if slope != 1.0 || inter != 0.0 {
         for v in data.iter_mut() {

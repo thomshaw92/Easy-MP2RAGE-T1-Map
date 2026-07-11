@@ -287,11 +287,15 @@
     <h2><span class="step">B</span>BIDS dataset
       <span class="i" data-tip="Each session shows the roles for a T1 map (UNI + INV2 + a B1 source) or denoise (UNI + INV1 + INV2). Green = matched, amber = non-standard or ambiguous (check it), red = missing (assign it by hand). ⚙ Calculate runs it using the parameters from that session's JSON sidecars (plus the current preset for TRFLASH, which BIDS does not store); the map then downloads on the row and shows in the viewer. Use 'Download & unload' to save it and free all memory before the next subject.">i</span>
     </h2>
-    <div class="row" style="align-items:center;gap:10px;margin-bottom:8px">
+    <div class="row" style="align-items:center;gap:10px 14px;margin-bottom:8px;flex-wrap:wrap">
       <span id="bidsSummary" class="note"></span>
       <span style="flex:1"></span>
+      <span class="note" style="opacity:.8">defaults:</span>
+      <label class="chk" title="Batch default for extend-B1-FOV. Each session has its own toggle that overrides this."><input type="checkbox" id="bidsExtendFov"> extend B1 FOV</label>
+      <label class="chk" title="Batch default for filling non-converged T1 voxels. Each session has its own toggle that overrides this."><input type="checkbox" id="bidsFallback"> fill non-converged</label>
+      <label class="chk" title="Batch default denoise strength (β). Each denoise session has its own field that overrides this.">denoise β <input type="number" id="bidsReg" value="6" step="1" min="1" style="width:52px"></label>
       <label class="chk" title="Log the parameters, each processing stage, and output statistics while calculating."><input type="checkbox" id="bidsVerbose"> verbose log</label>
-      <label class="chk" title="When a run finishes, automatically download its T1 map / UNI-DEN so nothing piles up in memory."><input type="checkbox" id="bidsAutoDl" checked> auto-download output</label>
+      <label class="chk" title="When a run finishes, automatically download its output. Off by default so you can inspect the result before downloading; you are prompted to download before moving to the next session."><input type="checkbox" id="bidsAutoDl"> auto-download output</label>
       <button class="secondary" id="bidsNext" type="button" title="Calculate the next session that has not been processed yet.">Calculate next ▶</button>
       <button class="secondary" id="bidsClose" type="button">✕ Close</button>
     </div>
@@ -364,6 +368,10 @@
       <label class="chk" title="Remove patient identity from the derived DICOM output.">
         <input type="checkbox" id="deid" checked> De-identify output DICOM
         <span class="i" data-tip="Only affects the derived DICOM T1 series (produced when the input was a DICOM folder). Removes patient name / ID / birth date, institution, physician and date tags, and private tags, and marks the series de-identified. The NIfTI outputs never contain these tags.">i</span>
+      </label>
+      <label class="chk" title="Fill non-converged T1 voxels (mostly CSF and other long-T1 fluid) with the uncorrected T1 instead of leaving them empty.">
+        <input type="checkbox" id="fallbackUncorr"> Fill non-converged voxels
+        <span class="i" data-tip="Where the B1-corrected T1 could not be estimated (mostly CSF / long-T1 voxels), fill with the uncorrected T1 rather than 0. Recovers the voxels that have a valid uncorrected value; voxels the UNI cannot invert at all stay empty.">i</span>
       </label>
       <span id="status" class="note">Add inputs to enable.</span>
     </div>

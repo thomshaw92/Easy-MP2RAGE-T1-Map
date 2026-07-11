@@ -1,4 +1,4 @@
-//! End-to-end pipeline assembly — Rust mirror of `mp2rage_t1/pipeline.py`
+//! End-to-end pipeline assembly: Rust mirror of `mp2rage_t1/pipeline.py`
 //! (SA2RAGE B1 source and direct B1-map source), operating on in-memory arrays
 //! so it can be unit-tested against the golden checkpoints.
 
@@ -62,6 +62,7 @@ pub fn run_sa2rage(
     sa_aff: &Affine,
     mp: &Mp2rageParams,
     sa: &Sa2rageParams,
+    fallback_uncorrected: bool,
 ) -> Outputs {
     let dim = uni.dim();
     let mask = brain_mask(inv2, 0.12);
@@ -136,8 +137,10 @@ pub fn run_sa2rage(
     let b1c = res.b1;
     for (idx, &m) in mask.indexed_iter() {
         let noncov = b1c[idx] >= 1.9 || b1c[idx] <= 0.05 || isclose_4000(t1_corr[idx]);
-        if noncov || !m {
+        if !m {
             t1_corr[idx] = 0.0;
+        } else if noncov {
+            t1_corr[idx] = if fallback_uncorrected { t1_uncorr[idx] } else { 0.0 };
         }
     }
     let b1 = b1_out.mapv(|v| if v.is_nan() { 0.0 } else { v });
@@ -158,6 +161,7 @@ pub fn run_b1map(
     ref_angle: f64,
     mp: &Mp2rageParams,
     extend_fov: bool,
+    fallback_uncorrected: bool,
 ) -> Outputs {
     let dim = uni.dim();
     let mask = brain_mask(inv2, 0.12);
@@ -188,11 +192,17 @@ pub fn run_b1map(
     let res = t1b1_correct_with_b1map(uni, &b1_in, mp, &mask);
     let mut t1_corr = res.t1_ms;
     for (idx, &m) in mask.indexed_iter() {
-        if isclose_4000(t1_corr[idx]) || !m {
+        if !m {
             t1_corr[idx] = 0.0;
+        } else if isclose_4000(t1_corr[idx]) {
+            t1_corr[idx] = if fallback_uncorrected { t1_uncorr[idx] } else { 0.0 };
         }
     }
-    let mut b1 = b1_grid.clone();
+    // Export contract: 0 outside the mask, finite everywhere else. In-mask voxels
+    // outside the measured B1 FOV are NaN (resample fill) when extend_fov is off,
+    // or if the polynomial extend could not fit; map those to 0 so the saved B1
+    // NIfTI never carries NaN (mirrors run_sa2rage at the top of this file).
+    let mut b1 = b1_grid.mapv(|v| if v.is_nan() { 0.0 } else { v });
     for (idx, &m) in mask.indexed_iter() {
         if !m {
             b1[idx] = 0.0;

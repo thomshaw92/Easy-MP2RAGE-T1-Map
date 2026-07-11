@@ -52,7 +52,7 @@ fn sa_params(p: &[f64]) -> Sa2rageParams {
     Sa2rageParams { tr: p[0], tis: (p[1], p[2]), flip: (p[3], p[4]), nz: (p[5], p[6]), flash_tr: p[7], average_t1: p[8] }
 }
 
-/// Result of a correction — flat volumes (i fastest) in the MP2RAGE grid.
+/// Result of a correction: flat volumes (i fastest) in the MP2RAGE grid.
 #[wasm_bindgen]
 pub struct T1Result {
     t1: Vec<f32>,
@@ -107,6 +107,7 @@ pub fn t1map_sa2rage(
     sa_aff: &[f32],
     mp: &[f64],
     sa_p: &[f64],
+    fallback_uncorrected: bool,
 ) -> T1Result {
     let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
     let (sx, sy, sz) = (sa_dims[0] as usize, sa_dims[1] as usize, sa_dims[2] as usize);
@@ -119,6 +120,7 @@ pub fn t1map_sa2rage(
         &aff(sa_aff),
         &mp_params(mp),
         &sa_params(sa_p),
+        fallback_uncorrected,
     );
     T1Result {
         t1: flat_ifast(&out.t1_corr),
@@ -145,6 +147,7 @@ pub fn t1map_b1(
     ref_angle: f64,
     mp: &[f64],
     extend_fov: bool,
+    fallback_uncorrected: bool,
 ) -> T1Result {
     let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
     let (bx, by, bz) = (b1_dims[0] as usize, b1_dims[1] as usize, b1_dims[2] as usize);
@@ -163,6 +166,7 @@ pub fn t1map_b1(
         ref_angle,
         &mp_params(mp),
         extend_fov,
+        fallback_uncorrected,
     );
     T1Result {
         t1: flat_ifast(&out.t1_corr),
@@ -259,8 +263,10 @@ impl DicomOut {
 /// Write a derived T1 (ms) DICOM series from the source DICOM bytes (`concat` +
 /// `offsets`, as passed to `parse_dicom_series`) and the computed T1 volume
 /// (i-fastest, on the source grid). `salt` makes the generated UIDs unique.
-/// When `deidentify` is true, patient/identifying tags and private groups are
-/// stripped from the derived output (study linkage and geometry are preserved).
+/// When `deidentify` is true, the derived output keeps only a whitelist of
+/// technical/geometry/rendering/UID tags (everything else, including all source
+/// PHI and private groups, is dropped by omission) and the study/frame-of-
+/// reference UIDs are re-mapped to break linkage back to the source.
 #[wasm_bindgen]
 pub fn write_dicom_t1(concat: &[u8], offsets: &[u32], t1: &[f32], dims: &[u32], salt: &str, deidentify: bool) -> Result<DicomOut, JsValue> {
     let sources: Vec<&[u8]> = offsets.windows(2).filter_map(|w| {

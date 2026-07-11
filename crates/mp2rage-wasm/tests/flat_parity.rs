@@ -82,6 +82,7 @@ fn wasm_api_sa2rage_matches_golden() {
         &SA_AFF,
         &MP,
         &SA,
+        false, // fallback_uncorrected off → golden parity
     );
     assert_ifast("SA t1", &res.t1(), &g3("v_corr_T1_ms"), 1e-6, 1e-4);
     assert_ifast("SA uni_corr", &res.uni_corr(), &g3("v_corr_UNI"), 0.0, 0.0);
@@ -106,6 +107,7 @@ fn wasm_api_b1map_matches_golden() {
         80.0,
         &MP,
         false, // extend_fov off → golden parity
+        false, // fallback_uncorrected off → golden parity
     );
     assert_ifast("B1 t1", &res.t1(), &g3("v_b1map_corr_T1_ms"), 1e-6, 1e-4);
 }
