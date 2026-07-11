@@ -2,8 +2,10 @@
 
 A static single-page app that runs the MP2RAGE/SA2RAGE T1-mapping pipeline
 **entirely in your browser** via the Rust core compiled to WebAssembly. Drag in
-NIfTI files, assign roles, compute, preview, and download — **no upload, no
-server**; your data never leaves the tab.
+NIfTI files, assign roles, compute, preview, and download. **Your images are
+never uploaded** and there is no processing backend. (The hosted page loads
+Google Analytics 4, which reports anonymous page views only — never your images
+or results. Delete the GA `<script>` in `index.html` to self-host without it.)
 
 ## Build the WASM, then run
 

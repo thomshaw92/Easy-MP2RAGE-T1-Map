@@ -1,8 +1,11 @@
-// Easy MP2RAGE T1 Map — in-browser controller.
+// Easy MP2RAGE T1 Map, in-browser controller.
 // Parses NIfTI in JS (nifti.js), runs the WASM core in a Web Worker, previews
-// with NiiVue, and offers client-side downloads. No data ever leaves the tab.
+// with a self-contained canvas viewer, and offers client-side downloads. Your
+// images/results never leave the tab (the hosted page loads GA4, which sees
+// anonymous page views only).
 import { readNifti, writeNiftiF32, writeNiftiGz } from './nifti.js';
 import { zipStore } from './zip.js';
+import { indexBids } from './bids.js';
 import initWasm, { parse_dicom_series, write_dicom_t1 } from '../wasm/mp2rage_wasm.js';
 
 let wasmReady;
@@ -70,11 +73,12 @@ const saParams = () => [num('#sa_tr'), num('#sa_ti1'), num('#sa_ti2'), num('#sa_
 // ---- file ingest -----------------------------------------------------------
 const ROLES = ['(ignore)', 'UNI', 'INV1', 'INV2', 'SA2RAGE', 'B1 map'];
 const state = { files: [], jsons: [] };
+let appMode = 'single'; // 'single' (drag/drop, DICOM) or 'bids' (whole directory)
 
 function guessRole(name) {
   const n = name.toLowerCase();
   if (/sa2rage|sa2/.test(n)) return 'SA2RAGE';
-  // A flip-angle map ("famp") is unambiguously the B1 map — strongest signal.
+  // A flip-angle map ("famp") is unambiguously the B1 map, strongest signal.
   if (/famp|flip.?angle|fa[_-]?map/.test(n)) return 'B1 map';
   // Structural MP2RAGE images are matched BEFORE the weaker b1map/tfl hint:
   // Siemens MP2RAGE is itself a TFL sequence ("tfl3d1"), so "tfl" can appear in
@@ -83,12 +87,13 @@ function guessRole(name) {
   if (/inv-?2|inv2/.test(n)) return 'INV2';
   if (/inv-?1|inv1/.test(n)) return 'INV1';
   // A Siemens TFL B1-mapping sequence (TB1TFL / tfl_b1map) also exports an
-  // anatomical reference — that one must be ignored, not used for correction.
+  // anatomical reference, that one must be ignored, not used for correction.
   if (/tb1tfl|b1map|_b1\b|tfl.?b1|b1.?map/.test(n)) return /anat/.test(n) ? '(ignore)' : 'B1 map';
   return '(ignore)';
 }
 
 async function addFiles(fileList) {
+  if (appMode === 'bids') { log('In BIDS mode, switch to "Single dataset" to load individual files.'); return; }
   for (const file of fileList) {
     const lower = file.name.toLowerCase();
     const buf = await file.arrayBuffer();
@@ -122,7 +127,7 @@ function applySidecar(name, js) {
 }
 
 function reloadFromJsons() {
-  if (!state.jsons.length) { log('no JSON sidecars loaded — drop the .json files too'); return; }
+  if (!state.jsons.length) { log('no JSON sidecars loaded, drop the .json files too'); return; }
   for (const j of state.jsons) applySidecar(j.name, j.json);
   $('#paramSource').value = 'json';
   log(`reloaded MP2RAGE parameters from ${state.jsons.length} sidecar(s)`);
@@ -182,7 +187,7 @@ function byRole(r) { return state.files.find((f) => f.role === r); }
 // ---- import sanity checks (ND / duplicates / B1 anat-vs-famp) --------------
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
-// DICOM ImageType (0008,0008) tokens for a file — from the DICOM header, or from
+// DICOM ImageType (0008,0008) tokens for a file, from the DICOM header, or from
 // a matching dcm2niix .json sidecar for a NIfTI. Returns an UPPERCASE array or null.
 function imageTypeTokens(f) {
   if (f.imageType) return f.imageType.toUpperCase().split('\\').map((s) => s.trim()).filter(Boolean);
@@ -212,7 +217,7 @@ function renderWarnings() {
   for (const f of state.files) if (f.role !== '(ignore)') (byrole[f.role] ||= []).push(f);
   for (const [role, fs] of Object.entries(byrole))
     if (fs.length > 1)
-      msgs.push(`<b>${fs.length} images are set to ${role}</b> (${fs.map((f) => esc(f.name)).join(', ')}). Only one is used — check you picked the right one.`);
+      msgs.push(`<b>${fs.length} images are set to ${role}</b> (${fs.map((f) => esc(f.name)).join(', ')}). Only one is used, check you picked the right one.`);
   // 3) a B1 sequence's anatomical reference mistaken for the flip-angle (B1) map
   for (const f of state.files) {
     const t = imageTypeTokens(f);
@@ -250,7 +255,7 @@ function refreshRunState() {
     status = ok
       ? `Ready: ${mode === 'sa2rage' ? 'SA2RAGE' : 'B1-map'} correction${inv2 ? '' : ' (no INV2 → mask from UNI)'}.`
       : 'Need a UNI and a B1 source (SA2RAGE or B1 map).';
-    if (ok && sa && b1) status += ' Both a SA2RAGE and a B1 map are loaded — using SA2RAGE; set the B1 map’s role to (ignore) to use it instead.';
+    if (ok && sa && b1) status += ' Both a SA2RAGE and a B1 map are loaded, using SA2RAGE; set the B1 map’s role to (ignore) to use it instead.';
   }
   $('#run').disabled = !ok;
   $('#run').textContent = label;
@@ -279,6 +284,7 @@ function collectFiles(dirEntry) {
 }
 
 async function addDicomFolder(name, files) {
+  if (appMode === 'bids') { log('In BIDS mode, switch to "Single dataset" to load a DICOM folder.'); return; }
   if (!files.length) return;
   log(`reading DICOM folder "${name}" (${files.length} files) …`);
   await ensureWasm();
@@ -309,13 +315,13 @@ async function addDicomFolder(name, files) {
 
 async function handleDrop(e) {
   const dt = e.dataTransfer;
-  // Capture every entry synchronously — dataTransfer.items is emptied once this
+  // Capture every entry synchronously, dataTransfer.items is emptied once this
   // handler returns, so we must grab all of them before the first await.
   const entries = dt.items ? [...dt.items].map((it) => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean) : [];
   if (!entries.length) { if (dt.files?.length) await addFiles(dt.files); return; }
   const folders = entries.filter((en) => en.isDirectory);
   const fileEntries = entries.filter((en) => en.isFile);
-  if (folders.length > 1) log(`${folders.length} folders dropped — importing each as its own series …`);
+  if (folders.length > 1) log(`${folders.length} folders dropped, importing each as its own series …`);
   // loose dropped files (NIfTI/JSON vs. stray DICOM files)
   const dropped = await Promise.all(fileEntries.map(getFile));
   const niftis = dropped.filter((f) => /\.(nii(\.gz)?|json)$/i.test(f.name));
@@ -364,7 +370,7 @@ $('#folder').onchange = (e) => addPickedFolders(e.target.files);
 let worker = null;
 let running = false;
 
-// A fresh worker per run gives a clean WASM linear-memory heap — the large f64
+// A fresh worker per run gives a clean WASM linear-memory heap, the large f64
 // intermediates from a previous run are freed with the old instance. This is the
 // "clear cache" that stops re-runs from exhausting memory and crashing.
 function freshWorker() {
@@ -390,16 +396,20 @@ function finishRun() {
 function stopProcessing(msg) {
   if (worker) { try { worker.terminate(); } catch (e) { /* ignore */ } worker = null; }
   finishRun();
+  // don't leave a BIDS row stuck on "processing…" if the run was stopped
+  if (bidsMode && bidsCurrent && bidsCurrent._state === 'running') { bidsCurrent._state = 'loaded'; updateBidsStatus(bidsCurrent); updateBidsActions(bidsCurrent); }
   $('#progress').style.display = 'none'; setProgress(0);
   if (msg) log(msg);
 }
-$('#stop').onclick = () => stopProcessing('■ stopped — inputs and parameters kept. Ready to run again.');
+$('#stop').onclick = () => stopProcessing('■ stopped, inputs and parameters kept. Ready to run again.');
 
 // Full reset: clear all inputs, parameters, results and logs back to defaults.
 function resetAll() {
   if ((state.files.length || state.jsons.length) &&
       !confirm('Reset everything? This clears all loaded images, JSON sidecars, parameters and results.')) return;
   stopProcessing();
+  if (bidsMode) closeBids();
+  appMode = 'single'; applyModeVisibility(); // back to the default input mode
   state.files = []; state.jsons = [];
   clearOutputs(); lastViews = null; curKey = 't1';
   renderTable();
@@ -415,26 +425,28 @@ function resetAll() {
   if ($('#deid')) $('#deid').checked = true;
   if ($('#verbose')) $('#verbose').checked = false;
   refreshRunState();
-  log('↺ reset — all inputs, parameters and results cleared.');
+  log('↺ reset, all inputs, parameters and results cleared.');
 }
 $('#resetAll').onclick = resetAll;
 
 // ---- interactive guided tour ----------------------------------------------
 const TOUR = [
-  { sel: '#drop', title: '1 · Add your data', body:
-    'Drag whole <b>DICOM folders</b> here (drop several at once) or <b>.nii / .nii.gz</b> files. Roles — UNI, INV1, INV2, SA2RAGE, B1 map — are guessed from the headers/filenames; <b>check and correct them</b> in the Role column of the table that appears. Click any file (👁) to preview it. Amber warnings flag non-distortion-corrected (<code>_ND</code>) images and duplicate or mis-assigned series.' },
-  { sel: '#paramSource', title: '2 · Sequence parameters', body:
-    'Choose where the timing and flip-angle values come from: dropped <b>JSON sidecars</b>, the <b>DICOM headers</b> (auto-filled on import), or type them / use a <b>7T or 3T preset</b>. One value is never stored in DICOM — <b>TRFLASH</b> (the GRE readout TR); confirm it from your protocol, as a 1&nbsp;ms error is about 40&nbsp;ms in T1.' },
-  { sel: '#taskSel', title: '3 · Choose a task', body:
-    '<b>Make T1 map</b> — B1-corrected T1 from MP2RAGE (needs UNI + INV2 + a B1 source: SA2RAGE or a B1 map). <b>SA2RAGE → B1 map</b> — just the relative B1 map. <b>Denoise UNI → UNI-DEN</b> — removes the salt-and-pepper background (needs UNI + INV1 + INV2). If a B1 map is smaller than the MP2RAGE you can optionally extend it to the whole brain; that filled region is an <i>estimate</i>.' },
-  { sel: '#run', title: '4 · Compute', body:
-    'Press <b>Compute</b> to run in a background worker, so the page stays responsive. <b>Stop</b> cancels and keeps your inputs. <b>Verbose log</b> prints the exact parameters, each stage, and output statistics. <b>De-identify output DICOM</b> (on by default) strips patient tags from the derived DICOM series.' },
-  { sel: '#viewerWrap', title: '5 · Read the result', body:
-    'Three orthogonal planes — <b>scroll</b> with the mouse-wheel over a panel or drag the <b>A / C / S</b> sliders. Switch outputs (T1 corrected / uncorrected, B1, UNI) and colormaps. The histogram overlays uncorrected vs corrected T1 and marks the <b>white- and grey-matter peaks</b> automatically (at any field strength).', mayHide: true },
-  { sel: '#downloads', title: '6 · Download', body:
+  { sel: '.modeToggle', title: 'Step 1. Pick how you load data', body:
+    'Use <b>Single dataset</b> to run one scan by drag and drop or a DICOM folder. Use <b>BIDS directory</b> to load a whole dataset: it lists every subject and session, matches the MP2RAGE and fmap files, and gives each one a <b>Calculate</b> button that runs it from its JSON parameters. The map downloads on the row, and <b>Download and unload</b> frees the memory before the next subject. The two modes are separate, so you never mix a single scan with a batch.' },
+  { sel: '#drop', title: 'Step 2. Add your data (single mode)', body:
+    'Drag whole <b>DICOM folders</b> here (several at once) or <b>.nii / .nii.gz</b> files. Roles (UNI, INV1, INV2, SA2RAGE, B1 map) are guessed from the headers and filenames. Check and fix them in the Role column of the table that appears, and click any file (👁) to preview it. Amber warnings flag non distortion corrected (<code>_ND</code>) images and duplicate or mis assigned series.' },
+  { sel: '#paramSource', title: 'Step 3. Sequence parameters', body:
+    'Choose where the timing and flip angle values come from: dropped <b>JSON sidecars</b>, the <b>DICOM headers</b> (filled in on import), or type them and use a <b>7T or 3T preset</b>. TRFLASH (the GRE readout TR) is not stored in DICOM, so confirm it from your protocol. A 1&nbsp;ms error is about 40&nbsp;ms in T1.' },
+  { sel: '#taskSel', title: 'Step 4. Choose a task', body:
+    '<b>Make T1 map</b>: a B1 corrected T1 from MP2RAGE (needs UNI, INV2, and a B1 source, which is SA2RAGE or a B1 map). <b>SA2RAGE to B1 map</b>: just the relative B1 map. <b>Denoise UNI to UNI-DEN</b>: removes the salt and pepper background (needs UNI, INV1, INV2). If a B1 map is smaller than the MP2RAGE you can extend it to the whole brain, but that filled region is an estimate.' },
+  { sel: '#run', title: 'Step 5. Compute', body:
+    'Press <b>Compute</b> to run in a background worker, so the page stays responsive. <b>Stop</b> cancels and keeps your inputs. <b>Verbose log</b> prints the parameters, each stage, and output statistics. <b>De-identify output DICOM</b> (on by default) removes patient tags from the derived DICOM series.' },
+  { sel: '#viewerWrap', title: 'Step 6. Read the result', body:
+    'There are three planes. Scroll with the mouse wheel over a panel, or drag the <b>A / C / S</b> sliders. Switch outputs (T1 corrected, T1 uncorrected, B1, UNI) and colormaps. The histogram overlays uncorrected and corrected T1 and marks the <b>white and grey matter peaks</b> automatically, at any field strength.', mayHide: true },
+  { sel: '#downloads', title: 'Step 7. Download', body:
     'Save each map as <b>NIfTI</b> (.nii.gz), the derived <b>DICOM</b> T1 series (when the input was a DICOM folder), or <b>everything as one .zip</b>. A <code>parameters.json</code> records every value used.', mayHide: true },
-  { sel: '.badge', title: 'Private by design', body:
-    'Everything runs in this browser tab. <b>Nothing is uploaded and there is no server</b> — you can disconnect from the network and it still works. <b>Reset all</b> clears everything to start over.' },
+  { sel: '.badge', title: 'Privacy', body:
+    'Your images and all processing stay in this browser tab. They are <b>never uploaded</b>, and it works with the network off. The page uses <b>anonymous usage analytics</b> (page views only, for the NeuroDesk team) that never include your images or results. <b>Reset all</b> clears everything so you can start over.' },
 ];
 let tourStep = 0, tourSpotEl = null;
 function tourClearSpot() { if (tourSpotEl) { tourSpotEl.classList.remove('tour-spot'); tourSpotEl = null; } }
@@ -498,7 +510,7 @@ function validateBeforeRun(sel) {
     if (f && !sameGrid(uni, f)) return `${nm} (${d3(f)}) and UNI (${d3(uni)}) have different dimensions. They must be on the same grid.`;
   }
   if (mode === 'sa2rage' && sa && (sa.dims[3] || 1) < 2)
-    return `SA2RAGE must be a 2-volume (S1,S2) image — this one is ${sa.dims.slice(0, 4).join('×')}. Load the original 2-volume SA2RAGE.`;
+    return `SA2RAGE must be a 2-volume (S1,S2) image, this one is ${sa.dims.slice(0, 4).join('×')}. Load the original 2-volume SA2RAGE.`;
   const bad = [];
   const chk = (names, vals) => names.forEach((n, i) => { if (!Number.isFinite(vals[i])) bad.push(n); });
   chk(['TR', 'TI1', 'TI2', 'FA1', 'FA2', 'NZ1', 'NZ2', 'TRFLASH', 'invEff'], mpParams());
@@ -587,6 +599,7 @@ async function onResult(res, uni, task, mode, t0) {
     const full = String(res.message || 'unknown error');
     log('✖ processing failed: ' + full.split('\n')[0]);
     if (full.includes('\n')) { if ($('#verbose')?.checked) log(full); else log('  (turn on Verbose log for the full error)'); }
+    if (bidsMode && bidsCurrent) { bidsCurrent._state = 'error'; updateBidsStatus(bidsCurrent); updateBidsActions(bidsCurrent); }
     $('#progress').style.display = 'none'; setProgress(0); finishRun(); return;
   }
   if (res.type === 'progress') { setProgress(res.pct); if (res.stage && $('#verbose')?.checked) log('  · ' + res.stage); return; }
@@ -623,6 +636,9 @@ async function onResult(res, uni, task, mode, t0) {
   resetPlanes(dims); // axial ~2/3 up, coronal/sagittal mid
   $('#viewerWrap').style.display = 'block';
   showView($('#viewSel').value);
+  bidsEnsureColumn();
+  b1SanityWarn();
+  if (bidsMode && bidsCurrent) await bidsRunComplete(task);
   finishRun();
   setTimeout(() => { $('#progress').style.display = 'none'; setProgress(0); }, 800);
 }
@@ -643,7 +659,7 @@ async function buildDownloads(task, mode, uni) {
     addLink(dd, new Blob([gz], { type: 'application/gzip' }), fname);
     bundle.push({ name: fname, data: gz });
   }
-  // derived DICOM T1 series — only for the T1 task when the UNI input was a DICOM folder
+  // derived DICOM T1 series, only for the T1 task when the UNI input was a DICOM folder
   if (task === 't1' && uni && uni.src && outputs.t1) {
     try {
       await ensureWasm();
@@ -669,7 +685,7 @@ async function buildDownloads(task, mode, uni) {
   const provBytes = new TextEncoder().encode(JSON.stringify(prov, null, 2));
   addLink(dd, new Blob([provBytes], { type: 'application/json' }), 'parameters.json');
   bundle.push({ name: 'parameters.json', data: provBytes });
-  // "download all" — one zip of every derivative, shown first and highlighted
+  // "download all", one zip of every derivative, shown first and highlighted
   if (bundle.length > 1) {
     const a = addLink(dd, new Blob([zipStore(bundle)], { type: 'application/zip' }), 'all_derivatives.zip');
     a.textContent = '⬇ Download all (.zip)';
@@ -741,7 +757,7 @@ function robustRange(data) {
 // Load an input volume into the same slice viewer used for outputs, so inputs
 // can be checked visually before/after running.
 function previewInput(f) {
-  if (!f || !f.data || !f.data.length) { log(`cannot preview ${f?.name || '?'} (no data — re-add the file)`); return; }
+  if (!f || !f.data || !f.data.length) { log(`cannot preview ${f?.name || '?'} (no data, re-add the file)`); return; }
   const dims = (f.dims || []).slice(0, 3);
   outputs.__preview = { data: f.data, dims, affine: f.affine, label: 'INPUT · ' + f.name, range: robustRange(f.data), cmap: 'gray' };
   const label = 'INPUT · ' + f.name + (f.role && f.role !== '(ignore)' ? ` (${f.role})` : '');
@@ -750,7 +766,8 @@ function previewInput(f) {
   $('#viewerWrap').style.display = 'block';
   $('#viewSel').value = '__preview';
   showView('__preview');
-  $('#viewerWrap').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  bidsEnsureColumn();
+  if (!bidsMode) $('#viewerWrap').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 function drawPlane(canvas, o, plane, idx) {
@@ -833,7 +850,7 @@ function drawHistogram(o) {
   }
 
   ctx.fillStyle = '#93a1b0';
-  ctx.fillText(isT1 ? 'T1 histogram (brain)' : `${o.label} — brain histogram`, pad, 12);
+  ctx.fillText(isT1 ? 'T1 histogram (brain)' : `${o.label}, brain histogram`, pad, 12);
   ctx.fillText(String(Math.round(rlo)), pad, H - 5);
   ctx.textAlign = 'right'; ctx.fillText(String(Math.round(rhi)), W - 5, H - 5); ctx.textAlign = 'left';
 
@@ -849,7 +866,7 @@ function drawHistogram(o) {
   if (!isT1) return;
   // WM/GM peaks detected dynamically (field-agnostic: works at 3T and 7T) as the
   // two most prominent modes of the corrected (post) T1 distribution. Lower T1 is
-  // white matter, higher is grey matter — true at every field strength.
+  // white matter, higher is grey matter, true at every field strength.
   const post = S[S.length - 1].sm;
   const modes = topTwoModes(post, nb, binT1);
   const labels = modes.length === 2 ? ['WM', 'GM'] : ['peak'];
@@ -885,6 +902,31 @@ function topTwoModes(sm, nb, binT1) {
   return picks.sort((a, b) => a - b); // low T1 (WM) first
 }
 
+// Sanity-check the relative B1 map: a real B1+ transmit field sits near 1.0 and
+// varies smoothly. If it is far from 1.0 or wildly non-uniform, the "B1 map" is
+// probably a magnitude/anatomical image or the wrong units, and the corrected T1
+// is invalid; warn and point the user to the uncorrected T1.
+function b1SanityWarn() {
+  const w = $('#viewWarn'); if (!w) return;
+  const o = outputs.b1;
+  if (!o || !o.data) { w.style.display = 'none'; return; }
+  const d = o.data, n = d.length, step = Math.max(1, Math.floor(n / 300000)), v = [];
+  for (let i = 0; i < n; i += step) { const x = d[i]; if (x > 0 && Number.isFinite(x)) v.push(x); }
+  if (v.length < 100) { w.style.display = 'none'; return; }
+  v.sort((a, b) => a - b);
+  const q = (p) => v[Math.min(v.length - 1, Math.floor(v.length * p))];
+  const med = q(0.5), spread = med > 0 ? (q(0.9) - q(0.1)) / med : 99;
+  if (med < 0.6 || med > 1.5 || spread > 0.85) {
+    w.innerHTML = `<b>⚠ This B1 map does not look like a B1⁺ field</b> (relative B1 median ${med.toFixed(2)}; a real transmit field sits near 1.0 and varies smoothly). ` +
+      `The input may be a magnitude/anatomical image rather than a flip-angle map, or the units/type are wrong. ` +
+      `The B1-corrected T1 is likely invalid. Switch the View to <b>T1 uncorrected</b> (also in the downloads), or supply a proper B1 map.`;
+    w.style.display = 'block';
+    log(`⚠ B1 sanity: relative B1 median ${med.toFixed(2)} (expected ~1.0); correction likely invalid; prefer the uncorrected T1.`);
+  } else {
+    w.style.display = 'none';
+  }
+}
+
 function showView(key) {
   const o = outputs[key];
   if (!o) return;
@@ -911,6 +953,448 @@ for (const [cid, p] of [['#cax', 'ax'], ['#cco', 'co'], ['#csa', 'sa']]) {
     drawSlices(o);
   }, { passive: false });
 }
+// redraw slices + histogram when the viewport (and so the docked column) resizes,
+// so the histogram re-fits its container dynamically
+let _viewerResizeT;
+window.addEventListener('resize', () => {
+  clearTimeout(_viewerResizeT);
+  _viewerResizeT = setTimeout(() => {
+    const o = outputs[curKey];
+    if (o && $('#viewerWrap').style.display !== 'none') { drawSlices(o); drawHistogram(o); }
+  }, 150);
+});
+
+// ---- BIDS batch mode -------------------------------------------------------
+// Index a BIDS dataset, list every subject/session with role-matching status,
+// and run them one at a time through the existing pipeline/viewer. Only one
+// entry is ever held in memory: loading the next frees the previous.
+let bidsIndex = null, bidsMode = false, bidsCurrent = null, bidsLoading = false;
+const baseName = (p) => (p || '').split('/').pop();
+const entryLabel = (s) => s._sub + (s.id ? ' · ' + s.id : '');
+
+// ---- input-mode toggle (single vs BIDS are mutually exclusive) ------------
+function syncModeButtons() {
+  $('#modeSingle').classList.toggle('active', appMode === 'single');
+  $('#modeBids').classList.toggle('active', appMode === 'bids');
+  $('#modeSingle').setAttribute('aria-selected', appMode === 'single');
+  $('#modeBids').setAttribute('aria-selected', appMode === 'bids');
+}
+function applyModeVisibility() {
+  const bids = appMode === 'bids';
+  $('#drop').style.display = bids ? 'none' : '';
+  $('#dicomRow').style.display = bids ? 'none' : '';
+  $('#bidsRow').style.display = bids ? '' : 'none';
+  syncModeButtons();
+}
+function setAppMode(mode) {
+  if (mode === appMode) return;
+  if (running) { log('Stop the current run before switching modes.'); return; }
+  if (bidsMode) closeBids();
+  revokeDownloadUrls(); clearOutputs(); lastViews = null; bidsCurrent = null;
+  state.files = []; state.jsons = [];
+  $('#downloads').innerHTML = ''; $('#viewerWrap').style.display = 'none';
+  const wb = $('#warnings'); if (wb) { wb.innerHTML = ''; wb.style.display = 'none'; }
+  freeWorker(); renderTable();
+  appMode = mode;
+  applyModeVisibility();
+  refreshRunState();
+  log(mode === 'bids' ? 'Switched to BIDS directory mode. Choose a BIDS dataset root.' : 'Switched to single-dataset mode.');
+}
+$('#modeSingle').onclick = () => setAppMode('single');
+$('#modeBids').onclick = () => setAppMode('bids');
+applyModeVisibility();
+
+// ---- BIDS side-docked viewer (tree left, viewer sticky on the right) -------
+const _viewer = $('#viewerWrap');
+const _viewerHome = { parent: _viewer.parentNode, next: _viewer.nextElementSibling };
+function dockViewerBids() {
+  const slot = $('#bidsViewSlot');
+  if (slot && _viewer.parentNode !== slot) { slot.appendChild(_viewer); _viewer.classList.add('docked'); }
+}
+function undockViewer() {
+  if (_viewer.parentNode !== _viewerHome.parent) {
+    _viewerHome.next ? _viewerHome.parent.insertBefore(_viewer, _viewerHome.next) : _viewerHome.parent.appendChild(_viewer);
+  }
+  _viewer.classList.remove('docked');
+  _viewer.style.display = ''; // back to CSS default (hidden until a single-mode run)
+  const cols = $('#bidsCols'); if (cols) cols.classList.remove('with-viewer');
+}
+// Keep the right viewer column present in BIDS mode.
+function bidsEnsureColumn() { if (!bidsMode) return; const cols = $('#bidsCols'); if (cols) cols.classList.add('with-viewer'); }
+// Blank the docked viewer with a short hint when nothing is loaded.
+function bidsShowPlaceholder() {
+  bidsEnsureColumn();
+  _viewer.style.display = 'block';
+  $('#viewStat').textContent = 'Load or calculate a session to view it here.';
+  for (const id of ['#cax', '#cco', '#csa', '#hist']) { const c = $(id); if (c) c.getContext('2d').clearRect(0, 0, c.width, c.height); }
+  $('#downloads').innerHTML = '';
+  const vw = $('#viewWarn'); if (vw) vw.style.display = 'none';
+}
+
+$('#pickBids').onclick = () => $('#bidsInput').click();
+$('#bidsInput').onchange = (e) => loadBidsDirectory(e.target.files);
+$('#bidsClose').onclick = closeBids;
+$('#bidsNext').onclick = calculateNextBidsEntry;
+// the BIDS verbose toggle drives the shared #verbose used by the run path
+$('#bidsVerbose').onchange = () => { if ($('#verbose')) $('#verbose').checked = $('#bidsVerbose').checked; };
+
+function closeBids() {
+  if (running) stopProcessing();
+  undockViewer(); // move the viewer back to its full-width home before clearing
+
+  if (bidsIndex?._flat) for (const s of bidsIndex._flat) if (s._dlUrl) { try { URL.revokeObjectURL(s._dlUrl); } catch (e) { /* */ } s._dlUrl = null; }
+  bidsMode = false; bidsCurrent = null; bidsIndex = null;
+  // free the loaded session (outputs, inputs, worker heap) and reset the viewer
+  clearOutputs(); state.files = []; state.jsons = []; lastViews = null;
+  revokeDownloadUrls(); $('#downloads').innerHTML = '';
+  $('#viewerWrap').style.display = 'none';
+  const wb = $('#warnings'); if (wb) { wb.innerHTML = ''; wb.style.display = 'none'; }
+  freeWorker(); renderTable();
+  $('#bidsPanel').classList.add('hidden');
+  $('#bidsTree').innerHTML = '';
+  log('BIDS mode closed.');
+}
+
+function loadBidsDirectory(fileList) {
+  // normalise every path to start at the "sub-XX/…" segment (strip any parent dirs)
+  const entries = [];
+  for (const f of [...fileList]) {
+    const segs = (f.webkitRelativePath || f.name).replace(/\\/g, '/').split('/');
+    const si = segs.findIndex((s) => /^sub-[A-Za-z0-9]+$/.test(s));
+    entries.push({ path: si >= 0 ? segs.slice(si).join('/') : segs.join('/'), file: f });
+  }
+  let idx;
+  try { idx = indexBids(entries); }
+  catch (err) { log('BIDS: could not index this directory: ' + err); return; }
+  if (!idx.nSubjects) { log('BIDS: no sub-* subjects found here. Point at a BIDS dataset root.'); return; }
+  bidsIndex = idx; bidsMode = true; bidsCurrent = null;
+  bidsIndex._flat = [];
+  for (const sub of idx.subjects) for (const ses of sub.sessions) {
+    ses._sub = sub.id; ses._roles = { ...ses.roles }; ses._state = 'pending';
+    bidsIndex._flat.push(ses);
+  }
+  const runnable = bidsIndex._flat.filter((s) => s.runnable.t1 || s.runnable.b1only || s.runnable.denoise).length;
+  $('#bidsSummary').textContent = `${idx.nSubjects} subject(s) · ${idx.nSessions} session(s) · ${runnable} runnable`;
+  renderBidsTree();
+  $('#bidsPanel').classList.remove('hidden');
+  dockViewerBids(); bidsShowPlaceholder(); // permanent viewer on the right
+  $('#bidsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  log(`BIDS: indexed ${idx.nSubjects} subject(s), ${idx.nSessions} session(s); ${runnable} runnable.`);
+}
+
+function renderBidsTree() {
+  const tree = $('#bidsTree'); tree.innerHTML = '';
+  for (const sub of bidsIndex.subjects) {
+    const det = document.createElement('details'); det.className = 'bids-sub';
+    det.open = bidsIndex.subjects.length <= 6;
+    const sum = document.createElement('summary');
+    sum.textContent = `${sub.id}, ${sub.sessions.length} session(s)`;
+    det.appendChild(sum);
+    for (const ses of sub.sessions) det.appendChild(renderBidsSession(ses));
+    tree.appendChild(det);
+  }
+}
+
+const BIDS_ROLES = [['UNI', 'UNI'], ['INV1', 'INV1'], ['INV2', 'INV2'], ['B1SOURCE', 'B1 source']];
+
+const roleLabel = (rk) => ({ UNI: 'UNI', INV1: 'INV1', INV2: 'INV2', B1SOURCE: 'B1 source' }[rk] || rk);
+function bidsInitSession(ses) {
+  if (ses._task === undefined) ses._task = ses.runnable.t1 ? 't1' : ses.runnable.b1only ? 'b1only' : ses.runnable.denoise ? 'denoise' : null;
+  if (ses._editRole === undefined) ses._editRole = 'UNI';
+}
+function bidsTasks(ses) {
+  const t = [];
+  if (ses.runnable.t1) t.push(['t1', 'Make T1 map']);
+  if (ses.runnable.b1only) t.push(['b1only', 'SA2RAGE → B1 map']);
+  if (ses.runnable.denoise) t.push(['denoise', 'Denoise UNI → UNI-DEN']);
+  return t;
+}
+function bidsRecomputeRunnable(ses) {
+  const has = (rk) => !!ses._roles[rk];
+  ses.runnable = {
+    t1: has('UNI') && has('INV2') && has('B1SOURCE'),
+    denoise: has('UNI') && has('INV1') && has('INV2'),
+    b1only: has('UNI') && has('INV2') && has('B1SOURCE') && ses.b1kind === 'sa2rage',
+  };
+  const tasks = bidsTasks(ses).map((x) => x[0]);
+  if (!tasks.includes(ses._task)) ses._task = tasks[0] || null;
+}
+function fillReassign(ses, sel) {
+  sel.innerHTML = '';
+  const none = document.createElement('option'); none.value = ''; none.textContent = '(none)'; sel.appendChild(none);
+  const cur = ses._roles[ses._editRole];
+  for (const f of (ses.files || [])) {
+    const o = document.createElement('option'); o.value = f.path; o.textContent = baseName(f.path);
+    if (cur && cur.path === f.path) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+function rerenderBidsSession(ses) {
+  const fresh = renderBidsSession(ses);
+  if (ses._el && ses._el.parentNode) ses._el.parentNode.replaceChild(fresh, ses._el);
+}
+function bidsAssignRole(ses, rk, file) {
+  ses._roles[rk] = file;
+  if (rk === 'B1SOURCE') ses.b1kind = file ? (/tb1srge/i.test(file.path) ? 'sa2rage' : 'b1map') : ses.b1kind;
+  if (['loaded', 'done', 'unloaded'].includes(ses._state)) ses._state = 'pending'; // inputs changed, recompute
+  bidsRecomputeRunnable(ses);
+  rerenderBidsSession(ses);
+}
+function bidsChipClick(ses, rk, rlabel) {
+  previewBidsRole(ses, rk, rlabel);
+  ses._editRole = rk;
+  if (ses._el) ses._el.querySelectorAll('.chip').forEach((c) => c.classList.toggle('active', c.dataset.rk === rk));
+  const rn = ses._el && ses._el.querySelector('.bids-reassign b'); if (rn) rn.textContent = roleLabel(rk);
+  if (ses._reassignSel) fillReassign(ses, ses._reassignSel);
+}
+
+function renderBidsSession(ses) {
+  bidsInitSession(ses);
+  const box = document.createElement('div'); box.className = 'bids-ses'; ses._el = box;
+  if (bidsCurrent === ses) box.classList.add('current');
+  const anyTask = !!(ses.runnable.t1 || ses.runnable.b1only || ses.runnable.denoise);
+  const title = document.createElement('div'); title.className = 'lbl';
+  title.textContent = entryLabel(ses) + (anyTask ? '' : ', not runnable');
+  box.appendChild(title);
+  // clickable role chips: preview on the right + pick which role the reassign menu edits
+  const roles = document.createElement('div'); roles.className = 'bids-roles';
+  for (const [rk, rlabel] of BIDS_ROLES) {
+    const st = ses.status[rk] || { state: 'missing' };
+    const chosen = ses._roles[rk];
+    const cls = !chosen ? 'miss' : st.state === 'ok' ? 'ok' : 'warn';
+    const chip = document.createElement('span'); chip.className = 'chip clickable ' + cls; chip.dataset.rk = rk;
+    chip.textContent = `${rlabel}: ${chosen ? baseName(chosen.path) : '(none)'}`;
+    if (rk === ses._editRole) chip.classList.add('active');
+    chip.title = (st.reason ? st.reason + '  ·  ' : '') + (chosen ? 'click to preview and reassign this role' : 'click to reassign this role');
+    chip.onclick = () => bidsChipClick(ses, rk, rlabel);
+    roles.appendChild(chip);
+  }
+  box.appendChild(roles);
+  // controls: task selector + reassign menu (follows the active chip)
+  const ctrl = document.createElement('div'); ctrl.className = 'bids-ctrl';
+  const tasks = bidsTasks(ses);
+  if (tasks.length) {
+    const tl = document.createElement('label'); tl.textContent = 'Task: ';
+    const tsel = document.createElement('select');
+    for (const [v, lbl] of tasks) { const o = document.createElement('option'); o.value = v; o.textContent = lbl; if (v === ses._task) o.selected = true; tsel.appendChild(o); }
+    tsel.onchange = () => { ses._task = tsel.value; updateBidsActions(ses); };
+    tl.appendChild(tsel); ctrl.appendChild(tl);
+  }
+  const rl = document.createElement('label'); rl.className = 'bids-reassign'; rl.appendChild(document.createTextNode('Reassign '));
+  const rn = document.createElement('b'); rn.textContent = roleLabel(ses._editRole); rl.appendChild(rn); rl.appendChild(document.createTextNode(': '));
+  const rsel = document.createElement('select'); ses._reassignSel = rsel; fillReassign(ses, rsel);
+  rsel.onchange = () => bidsAssignRole(ses, ses._editRole, (ses.files || []).find((f) => f.path === rsel.value) || null);
+  rl.appendChild(rsel); ctrl.appendChild(rl);
+  box.appendChild(ctrl);
+  // warnings
+  if (ses.warnings?.length) {
+    const w = document.createElement('div'); w.className = 'bids-warn'; w.textContent = '⚠ ' + ses.warnings.join('  ·  ');
+    box.appendChild(w);
+  }
+  // actions
+  const act = document.createElement('div'); act.className = 'bids-actions'; ses._actEl = act;
+  box.appendChild(act);
+  const status = document.createElement('span'); status.className = 'bids-status'; ses._statusEl = status;
+  box.appendChild(status);
+  updateBidsActions(ses); updateBidsStatus(ses);
+  return box;
+}
+
+function updateBidsStatus(ses) {
+  if (!ses._statusEl) return;
+  const m = { pending: '', loading: '⋯ loading…', loaded: '● loaded, press Compute', running: '⋯ processing…', done: '✓ done, result in the viewer', error: '✖ error', unloaded: '✓ saved & unloaded' };
+  ses._statusEl.textContent = m[ses._state] || '';
+}
+
+// Rebuild the per-session buttons for the current state.
+function updateBidsActions(ses) {
+  const act = ses._actEl; if (!act) return;
+  act.innerHTML = '';
+  const mk = (txt, fn, cls) => { const b = document.createElement('button'); b.type = 'button'; if (cls) b.className = cls; b.textContent = txt; b.onclick = fn; act.appendChild(b); return b; };
+  const dlLink = () => { if (!ses._dlUrl) return; const a = document.createElement('a'); a.href = ses._dlUrl; a.download = ses._dlName; a.textContent = '⬇ ' + ses._dlName; act.appendChild(a); };
+  if (ses._state === 'running') { const s = document.createElement('span'); s.className = 'bids-status'; s.textContent = 'processing… (Stop to cancel)'; act.appendChild(s); return; }
+  if (ses._state === 'done') {
+    dlLink();
+    mk('👁 View', () => viewBidsResult(ses), 'secondary');
+    mk('Download & unload', () => downloadUnloadBids(ses), 'secondary');
+    return;
+  }
+  if (ses._state === 'unloaded') {
+    dlLink();
+    mk('⚙ Recalculate', () => calculateBidsEntry(ses), 'secondary');
+    return;
+  }
+  // pending / loaded / error
+  mk('load & edit', () => loadBidsEntry(ses, { scroll: false }), 'secondary');
+  if (!bidsTasks(ses).length) { const s = document.createElement('span'); s.className = 'bids-status'; s.textContent = 'not runnable (missing inputs)'; act.appendChild(s); return; }
+  const label = ses._task === 'b1only' ? '⚙ Calculate B1 map' : ses._task === 'denoise' ? '⚙ Calculate UNI-DEN' : '⚙ Calculate T1 map';
+  mk(label, () => calculateBidsEntry(ses));
+}
+
+// Preview one of a session's role images (UNI/INV1/INV2/B1) in the docked right
+// viewer. Uses the already-loaded copy when this session is current; otherwise
+// reads the file on demand (no need to load/run the whole session).
+async function previewBidsRole(ses, rk, rlabel) {
+  const f = ses._roles[rk];
+  if (!f) { log(`BIDS: no ${rlabel} file for ${entryLabel(ses)}.`); return; }
+  const appRole = rk === 'B1SOURCE' ? (ses.b1kind === 'sa2rage' ? 'SA2RAGE' : 'B1 map') : rk;
+  if (bidsCurrent === ses) {
+    const got = state.files.find((x) => x.role === appRole);
+    if (got && got.data && got.data.length) { previewInput(got); return; }
+  }
+  try {
+    bidsEnsureColumn();
+    $('#viewStat').textContent = `reading ${baseName(f.path)} …`;
+    const buf = await f.file.arrayBuffer();
+    const nii = await readNifti(buf);
+    previewInput({ name: baseName(f.path), dims: nii.dims, affine: nii.affine, data: nii.data, role: appRole });
+  } catch (e) { log(`BIDS: could not preview ${baseName(f.path)}: ${e}`); }
+}
+
+// Load one entry's files + parameters into the shared pipeline. Frees whatever
+// was loaded before, so only one session is ever in memory.
+async function loadBidsEntry(ses, opts = {}) {
+  if (running) { log('BIDS: a run is in progress, Stop it first.'); return false; }
+  if (bidsLoading) { log('BIDS: a session is still loading, one moment.'); return false; }
+  bidsLoading = true;
+  const scroll = opts.scroll !== false;
+  // starting a different session unloads the previous done result (and frees its download blob)
+  if (bidsCurrent && bidsCurrent !== ses && bidsCurrent._state === 'done') {
+    const prev = bidsCurrent;
+    if (prev._dlUrl) { try { URL.revokeObjectURL(prev._dlUrl); } catch (e) { /* */ } prev._dlUrl = null; }
+    prev._state = 'unloaded'; updateBidsStatus(prev); updateBidsActions(prev);
+  }
+  bidsCurrent = ses;
+  revokeDownloadUrls(); clearOutputs(); lastViews = null;
+  state.files = []; state.jsons = [];
+  bidsShowPlaceholder();
+  if (ses._dlUrl) { try { URL.revokeObjectURL(ses._dlUrl); } catch (e) { /* */ } ses._dlUrl = null; }
+  for (const s of bidsIndex._flat) if (s._el) s._el.classList.toggle('current', s === ses);
+  ses._state = 'loading'; updateBidsStatus(ses); updateBidsActions(ses);
+  try {
+    let b1type = 'tfl';
+    for (const rk of ['UNI', 'INV1', 'INV2', 'B1SOURCE']) {
+      const f = ses._roles[rk]; if (!f) continue;
+      let role;
+      if (rk === 'B1SOURCE') {
+        role = ses.b1kind === 'sa2rage' ? 'SA2RAGE' : 'B1 map';
+        b1type = /tb1tfl/i.test(f.path) ? 'tfl' : /tb1map|rb1cor/i.test(f.path) ? 'percent' : 'tfl';
+      } else role = rk;
+      const buf = await f.file.arrayBuffer();
+      const nii = await readNifti(buf);
+      state.files.push({ name: baseName(f.path), size: f.file.size, dims: nii.dims, affine: nii.affine, data: nii.data, role, bids: true });
+    }
+    for (const sc of (ses.sidecars || [])) {
+      try { state.jsons.push({ name: baseName(sc.path), json: JSON.parse(await sc.file.text()) }); } catch (e) { /* ignore */ }
+    }
+    if (state.jsons.length) { for (const j of state.jsons) applySidecar(j.name, j.json); $('#paramSource').value = 'json'; $('#paramSrcNote').textContent = 'from sidecars'; }
+    if (ses.b1kind !== 'sa2rage' && $('#b1_type')) $('#b1_type').value = b1type;
+    $('#taskSel').value = ses._task || (ses.runnable.t1 ? 't1' : ses.runnable.denoise ? 'denoise' : 't1');
+    renderTable(); refreshRunState();
+    ses._state = 'loaded'; updateBidsStatus(ses); updateBidsActions(ses);
+    log(`BIDS: loaded ${entryLabel(ses)} (${state.files.map((f) => f.role).join(', ')}${state.jsons.length ? '; params from ' + state.jsons.length + ' sidecar(s)' : ''}).`);
+    // show the input on the right immediately (no page scroll); user can click other roles to preview them
+    const uniFile = state.files.find((f) => f.role === 'UNI') || state.files[0];
+    if (uniFile) previewInput(uniFile);
+    void scroll;
+    return true;
+  } catch (err) {
+    ses._state = 'error'; updateBidsStatus(ses); updateBidsActions(ses);
+    log(`BIDS: failed to load ${entryLabel(ses)}: ${err}`);
+    return false;
+  } finally {
+    bidsLoading = false;
+  }
+}
+
+// One click: load this session (params from its JSON sidecars + preset defaults)
+// and run it. TRFLASH is not in BIDS, so it comes from the current preset.
+async function calculateBidsEntry(ses) {
+  if (running) { log('BIDS: a run is already in progress, Stop it first.'); return; }
+  if (bidsLoading) { log('BIDS: a session is still loading, one moment.'); return; }
+  const ok = await loadBidsEntry(ses, { scroll: false });
+  if (!ok) return;
+  const sel = refreshRunState();
+  const err = validateBeforeRun(sel);
+  if ($('#run').disabled || err) {
+    log(`BIDS: cannot calculate ${entryLabel(ses)}${err ? ': ' + err : ' (missing inputs).'}`);
+    ses._state = 'error'; updateBidsStatus(ses); updateBidsActions(ses); return;
+  }
+  ses._state = 'running'; updateBidsStatus(ses); updateBidsActions(ses);
+  $('#run').click(); // reuse the validated run path; onResult → bidsRunComplete
+}
+
+function bidsOutName(ses, task) {
+  const stem = ses._sub + (ses.id ? '_' + ses.id : '');
+  if (task === 'denoise') return `${stem}_desc-denoised_UNIT1.nii.gz`;
+  if (task === 'b1only') return `${stem}_B1map.nii.gz`;
+  return `${stem}_T1map.nii.gz`;
+}
+
+async function bidsRunComplete(task) {
+  const ses = bidsCurrent; if (!ses) return;
+  ses._state = 'done'; updateBidsStatus(ses);
+  const key = task === 'denoise' ? 'unic' : task === 'b1only' ? 'b1' : 't1';
+  const o = outputs[key];
+  if (o) {
+    const fname = bidsOutName(ses, task);
+    const gz = await writeNiftiGz(o.data, o.dims, o.affine);
+    if (ses._dlUrl) { try { URL.revokeObjectURL(ses._dlUrl); } catch (e) { /* */ } }
+    ses._dlUrl = URL.createObjectURL(new Blob([gz], { type: 'application/gzip' }));
+    ses._dlName = fname;
+    if ($('#bidsAutoDl')?.checked) {
+      const a = document.createElement('a'); a.href = ses._dlUrl; a.download = fname; a.style.display = 'none';
+      document.body.appendChild(a); a.click(); a.remove();
+      log(`BIDS: ${entryLabel(ses)} → downloaded ${fname}`);
+    } else log(`BIDS: ${entryLabel(ses)} done → ${fname} (download in the panel)`);
+  }
+  updateBidsActions(ses);
+  $('#viewerWrap').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function viewBidsResult(ses) {
+  if (bidsCurrent !== ses || (!outputs.t1 && !outputs.unic)) { log('BIDS: result no longer in memory, Recalculate to view.'); return; }
+  $('#viewerWrap').style.display = 'block';
+  showView($('#viewSel').value);
+  $('#viewerWrap').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// Free the (idle) worker's WASM heap, the big ~GB allocation, between subjects.
+function freeWorker() { if (worker && !running) { try { worker.terminate(); } catch (e) { /* */ } worker = null; } }
+
+// Save the output (if not already) and free ALL of this session's memory.
+function downloadUnloadBids(ses) {
+  if (ses._dlUrl) {
+    const a = document.createElement('a'); a.href = ses._dlUrl; a.download = ses._dlName; a.style.display = 'none';
+    document.body.appendChild(a); a.click(); a.remove();
+    try { URL.revokeObjectURL(ses._dlUrl); } catch (e) { /* */ } ses._dlUrl = null; // file is saved; drop the blob
+  }
+  clearOutputs(); state.files = []; state.jsons = []; lastViews = null;
+  revokeDownloadUrls();
+  bidsShowPlaceholder();
+  freeWorker();
+  if (ses._el) ses._el.classList.remove('current');
+  if (bidsCurrent === ses) bidsCurrent = null;
+  ses._state = 'unloaded'; updateBidsStatus(ses); updateBidsActions(ses);
+  log(`BIDS: ${entryLabel(ses)} saved and unloaded, memory freed.`);
+}
+
+// Calculate the next unprocessed runnable session (sequential batch, one click each).
+function calculateNextBidsEntry() {
+  if (!bidsIndex) { log('BIDS: no dataset loaded.'); return; }
+  if (running) { log('BIDS: a run is in progress, wait for it or Stop.'); return; }
+  const list = bidsIndex._flat;
+  const start = bidsCurrent ? list.indexOf(bidsCurrent) + 1 : 0;
+  for (let n = 0; n < list.length; n++) {
+    const s = list[(start + n) % list.length];
+    if ((s.runnable.t1 || s.runnable.b1only || s.runnable.denoise) && s._state !== 'done' && s._state !== 'unloaded') {
+      if (s._el) { const d = s._el.closest('details'); if (d) d.open = true; }
+      calculateBidsEntry(s);
+      return;
+    }
+  }
+  log('BIDS: all runnable sessions are processed. 🎉');
+}
 
 refreshRunState();
-log('Ready. Drop files or DICOM folders, pick a task, and Compute. Everything runs locally.');
+log('Ready. Drop files or DICOM folders, pick a task, and Compute. All image processing runs locally, your images never leave the tab.');

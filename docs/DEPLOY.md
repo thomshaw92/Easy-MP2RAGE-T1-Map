@@ -16,7 +16,7 @@ headers are needed** — it runs on plain GitHub Pages.
 Your site will be at:
 
 ```
-https://thomshaw92.github.io/Easy-MP2RAGE-T1-Map/
+https://mp2rage.neurodesk.org/
 ```
 
 Every later push to `main` re-deploys automatically. `CI` (tests + WASM build +
@@ -26,29 +26,31 @@ the headless data-path check) runs on every push/PR.
 
 `build` job: install Rust + `wasm-pack` → `tools/build_wasm.sh` (builds the WASM
 into `web/wasm/`) → upload `web/` as the Pages artifact. `deploy` job publishes it.
-All asset paths are relative, so the `/Easy-MP2RAGE-T1-Map/` project-site base path
-works with no extra config.
+All asset paths are relative, so it works at the custom-domain root with no config.
 
-## NeuroDesk subdomain + listing (you — needs NeuroDesk maintainers)
+## NeuroDesk custom domain + listing
 
-To get a `easy-mp2rage-t1map.neurodesk.org`-style URL and a spot on the NeuroDesk
-applications page (like qsmbly.neurodesk.org):
+NeuroDesk provided the domain **`mp2rage.neurodesk.org`** and set up the DNS. To
+finish (needs the GitHub UI):
 
-1. Confirm the GitHub Pages site above is live and working.
-2. Open an **issue / discussion / PR** on the NeuroDesk web repo
-   (start at <https://www.neurodesk.org/> → GitHub) requesting a **subdomain +
-   applications-page listing**, and give them the Pages URL. They arrange a DNS
-   **CNAME** (`easy-mp2rage-t1map.neurodesk.org → thomshaw92.github.io`).
-3. Once the CNAME exists, add a file `web/CNAME` containing just the domain
-   (e.g. `easy-mp2rage-t1map.neurodesk.org`) and push — the deploy will serve it
-   there — then tick **Enforce HTTPS** in Settings → Pages. (Ping me and I'll add
-   the `web/CNAME` file once you have the domain.)
+1. `web/CNAME` already contains `mp2rage.neurodesk.org`, so the deploy serves it
+   there.
+2. In the repo, go to **Settings → Pages → Custom domain**, enter
+   `mp2rage.neurodesk.org`, and Save. Wait for the DNS check to pass, then tick
+   **Enforce HTTPS**.
+3. Tell the NeuroDesk team it is live so they add it to
+   <https://neurodesk.org/getting-started/hosted/webapps/>.
 
-Deploying to `<owner>.github.io` first (fully functional) and adding the subdomain
-later is the recommended order — don't block launch on the subdomain.
+## Analytics
+
+`web/index.html` loads Google Analytics 4 (measurement ID `G-4Z9774J59Y`) so the
+NeuroDesk team can see anonymous usage (page views / interactions). It never sees
+any images or results — those are processed entirely in the visitor's browser and
+are never uploaded. To self-host without analytics, delete the GA `<script>` block
+near the top of `web/index.html`.
 
 ## Notes
 
-- No runtime CDN dependencies (CSP-safe); the viewer is a self-contained canvas.
-- Nothing about the deploy changes the privacy model — all image processing still
-  happens in the visitor's browser; the static host never sees any data.
+- The only third-party runtime request is the Google Analytics tag; everything else
+  (WASM, viewer, workers) is self-contained. Image processing always happens in the
+  visitor's browser and the static host never sees any data.

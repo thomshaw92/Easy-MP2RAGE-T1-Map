@@ -3,12 +3,17 @@
 B1-corrected T1 mapping from MP2RAGE, at 3T and 7T. Runs in the browser or from
 the command line.
 
-Web app: https://thomshaw92.github.io/Easy-MP2RAGE-T1-Map/
+Web app: https://mp2rage.neurodesk.org/
 
 Drag in DICOM folders or NIfTI files, set their roles, and it computes a
-B1-corrected T1 map in your browser. Nothing is uploaded and there is no server.
-Outputs download as NIfTI. When the input was a DICOM folder, the T1 map also
-downloads as a derived DICOM series.
+B1-corrected T1 map in your browser. Your images are never uploaded and all
+processing runs client-side. Outputs download as NIfTI. When the input was a
+DICOM folder, the T1 map also downloads as a derived DICOM series.
+
+The hosted site loads Google Analytics for anonymous usage statistics (page
+views only, for the NeuroDesk team); it never has access to your images or
+results. Remove the Google Analytics snippet from web/index.html if you self-host
+and do not want it.
 
 ## What it does
 
@@ -105,7 +110,7 @@ so it must be served over http, not opened as a file:// path:
     # then open http://localhost:8080
 
 Any static file server works (for example `npx serve web`). All processing runs
-client-side; there is no backend and nothing is uploaded.
+client-side; there is no backend and your images are never uploaded.
 
 Tests:
 
